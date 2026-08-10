@@ -33,7 +33,10 @@ It is not a runnable `lmms-eval` checkout.
 
 4. Keyframe-based model inference support
 - Added `use_keyframe` support in `llava_vid`, `llava_onevision`, `internvl2`, `qwen2_vl`, `qwen2_5_vl`.
-- Added new helper: `lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py`.
+- Added a PyAV-only exact-index helper: `lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py`.
+- The default Qwen2.5-VL chat path preserves exported keyframe indices without a second uniform resampling pass.
+- PyAV PTS-derived sampling metadata is forwarded to the Qwen processor for temporal position construction.
+- Removed the unused top-level Decord import from `lmms_eval/protocol.py`.
 
 ## Modified File List
 
@@ -47,6 +50,7 @@ Tracked modified files:
 - `lmms_eval/models/simple/llava_vid.py`
 - `lmms_eval/models/simple/qwen2_5_vl.py`
 - `lmms_eval/models/simple/qwen2_vl.py`
+- `lmms_eval/protocol.py`
 - `lmms_eval/tasks/__init__.py`
 - `lmms_eval/tasks/longvideobench/longvideobench_val_v.yaml`
 - `lmms_eval/tasks/longvideobench/utils.py`

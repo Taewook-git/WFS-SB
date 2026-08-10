@@ -7,6 +7,10 @@ readonly DEFAULT_REPO_URL="https://github.com/MAC-AutoML/WFS-SB.git"
 readonly DEFAULT_REPO_BRANCH="main"
 readonly DEFAULT_LMMS_URL="https://github.com/EvolvingLMMs-Lab/lmms-eval.git"
 readonly LMMS_COMMIT="bb1ebe76e7a942386c25c4664f902e0e59e8a401"
+# Exact stable patch-id of lmms_eval_wfs.patch shipped through d19ab45.  This
+# permits a one-time, content-verified upgrade of an already bootstrapped
+# generated checkout without discarding arbitrary local work.
+readonly LEGACY_LMMS_PATCH_ID="23eb590a95c58f878849e6d58e332a2728d4699a"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 EMBEDDED_REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
@@ -358,11 +362,28 @@ log "Installing WFS-SB dependencies"
 "${VENV_PYTHON}" -m pip install -r "${REPO_DIR}/requirements-phase-stable.txt"
 
 patch_paths() {
-  git -C "${LMMS_DIR}" apply --numstat "${PATCH_FILE}" | awk -F '\t' '{print $3}'
+  local patch_file="${1:-${PATCH_FILE}}"
+  git -C "${LMMS_DIR}" apply --numstat "${patch_file}" | awk -F '\t' '{print $3}'
+}
+
+snapshot_lmms_worktree_patch() {
+  local output_file="$1"
+  shift
+  local temp_index
+
+  temp_index="$(mktemp)"
+  TEMP_PATHS+=("${temp_index}")
+  rm -f -- "${temp_index}"
+  GIT_INDEX_FILE="${temp_index}" git -C "${LMMS_DIR}" read-tree "${LMMS_COMMIT}"
+  # A temporary index is required here: git diff alone omits the untracked
+  # keyframe helper that was introduced by the legacy patch.
+  GIT_INDEX_FILE="${temp_index}" git -C "${LMMS_DIR}" add -A -- "$@"
+  GIT_INDEX_FILE="${temp_index}" git -C "${LMMS_DIR}" diff --cached --binary \
+    "${LMMS_COMMIT}" -- >"${output_file}"
 }
 
 validate_exact_lmms_patch() {
-  local status_entry path expected_id actual_id temp_index temp_diff
+  local status_entry path expected_id actual_id temp_diff
   local -a expected_paths=()
   local -A expected_lookup=()
 
@@ -376,24 +397,61 @@ validate_exact_lmms_patch() {
     path="${status_entry:3}"
     [[ -n "${expected_lookup[${path}]:-}" ]] || \
       die "lmms-eval has a change outside the supplied patch: ${path}"
-  done < <(git -C "${LMMS_DIR}" status --porcelain=v1 -z --untracked-files=normal)
+  done < <(git -C "${LMMS_DIR}" status --porcelain=v1 -z --untracked-files=all)
 
   git -C "${LMMS_DIR}" apply --reverse --check "${PATCH_FILE}" >/dev/null 2>&1 || \
     die "lmms-eval is partially patched or conflicts with the supplied patch"
 
-  temp_index="$(mktemp)"
   temp_diff="$(mktemp)"
-  TEMP_PATHS+=("${temp_index}" "${temp_diff}")
-  rm -f -- "${temp_index}"
-  GIT_INDEX_FILE="${temp_index}" git -C "${LMMS_DIR}" read-tree "${LMMS_COMMIT}"
-  GIT_INDEX_FILE="${temp_index}" git -C "${LMMS_DIR}" add -A -- "${expected_paths[@]}"
-  GIT_INDEX_FILE="${temp_index}" git -C "${LMMS_DIR}" diff --cached --binary \
-    "${LMMS_COMMIT}" -- >"${temp_diff}"
+  TEMP_PATHS+=("${temp_diff}")
+  snapshot_lmms_worktree_patch "${temp_diff}" "${expected_paths[@]}"
 
   expected_id="$(git patch-id --stable <"${PATCH_FILE}" | awk 'NR == 1 {print $1}')"
   actual_id="$(git patch-id --stable <"${temp_diff}" | awk 'NR == 1 {print $1}')"
   [[ -n "${expected_id}" && "${actual_id}" == "${expected_id}" ]] || \
     die "lmms-eval worktree is not exactly the supplied WFS patch"
+}
+
+migrate_exact_legacy_lmms_patch() {
+  local status_entry path actual_id legacy_diff
+  local -a expected_paths=()
+  local -A expected_lookup=()
+
+  mapfile -t expected_paths < <(patch_paths)
+  ((${#expected_paths[@]} > 0)) || die "lmms-eval patch contains no paths"
+  for path in "${expected_paths[@]}"; do
+    expected_lookup["${path}"]=1
+  done
+
+  # Refuse to snapshot, reverse, or otherwise touch a checkout containing any
+  # path outside the current patch's known path set.
+  while IFS= read -r -d '' status_entry; do
+    path="${status_entry:3}"
+    [[ -n "${expected_lookup[${path}]:-}" ]] || \
+      die "lmms-eval has a change outside the supplied patch: ${path}"
+  done < <(git -C "${LMMS_DIR}" status --porcelain=v1 -z --untracked-files=all)
+  # bootstrap applies patches to the worktree only. A staged change therefore
+  # cannot belong to the generated legacy state and must never be rewritten.
+  git -C "${LMMS_DIR}" diff --cached --quiet -- || \
+    die "lmms-eval index contains staged changes; refusing legacy migration"
+
+  legacy_diff="$(mktemp)"
+  TEMP_PATHS+=("${legacy_diff}")
+  snapshot_lmms_worktree_patch "${legacy_diff}" "${expected_paths[@]}"
+  actual_id="$(git patch-id --stable <"${legacy_diff}" | awk 'NR == 1 {print $1}')"
+  [[ -n "${actual_id}" && "${actual_id}" == "${LEGACY_LMMS_PATCH_ID}" ]] || \
+    die "lmms-eval has changes that are neither the current nor the exact legacy WFS patch"
+
+  git -C "${LMMS_DIR}" apply --reverse --check "${legacy_diff}" >/dev/null 2>&1 || \
+    die "exact legacy lmms-eval patch could not be safely reversed"
+  log "Migrating exact legacy WFS lmms-eval patch"
+  git -C "${LMMS_DIR}" apply --reverse "${legacy_diff}"
+  [[ -z "$(git -C "${LMMS_DIR}" status --porcelain --untracked-files=all)" ]] || \
+    die "lmms-eval was not clean after reversing the exact legacy patch"
+
+  git -C "${LMMS_DIR}" apply --check "${PATCH_FILE}" >/dev/null 2>&1 || \
+    die "current WFS lmms-eval patch does not apply after legacy migration"
+  git -C "${LMMS_DIR}" apply "${PATCH_FILE}"
 }
 
 setup_lmms_eval() {
@@ -424,11 +482,15 @@ setup_lmms_eval() {
   [[ "$(git -C "${LMMS_DIR}" rev-parse HEAD)" == "${LMMS_COMMIT}" ]] || \
     die "lmms-eval failed to select exact base commit ${LMMS_COMMIT}"
 
-  if git -C "${LMMS_DIR}" apply --check "${PATCH_FILE}" >/dev/null 2>&1; then
-    [[ -z "$(git -C "${LMMS_DIR}" status --porcelain --untracked-files=normal)" ]] || \
-      die "lmms-eval has unexpected changes before patching"
+  if git -C "${LMMS_DIR}" apply --reverse --check "${PATCH_FILE}" >/dev/null 2>&1; then
+    : # The exact-content validator below distinguishes complete from extra changes.
+  elif [[ -z "$(git -C "${LMMS_DIR}" status --porcelain --untracked-files=all)" ]]; then
+    git -C "${LMMS_DIR}" apply --check "${PATCH_FILE}" >/dev/null 2>&1 || \
+      die "current WFS lmms-eval patch does not apply to the pinned clean base"
     log "Applying WFS lmms-eval patch"
     git -C "${LMMS_DIR}" apply "${PATCH_FILE}"
+  else
+    migrate_exact_legacy_lmms_patch
   fi
   validate_exact_lmms_patch
   log "lmms-eval is at the exact base commit with the expected patch"
@@ -445,39 +507,44 @@ validate_installed_dependencies() {
   local check_output
   if check_output="$("${VENV_PYTHON}" -m pip check 2>&1)"; then
     [[ -z "${check_output}" ]] || printf '%s\n' "${check_output}"
-    return
-  fi
-
-  # Recent pip releases can falsely reject an installed platform wheel during
-  # `pip check`. Permit only the known Decord 0.6.0 diagnostic, then replace
-  # the metadata-only verdict with an actual encode/decode runtime smoke test.
-  if [[ "${check_output}" != "decord 0.6.0 is not supported on this platform" ]]; then
+  elif [[ "${check_output}" == "decord 0.6.0 is not supported on this platform" ]]; then
+    # lmms-eval declares Decord for other model backends, but this experiment's
+    # Qwen keyframe path is PyAV-only. Recent pip versions can reject Decord's
+    # installed wheel metadata even when installation itself succeeded.
+    log "pip reported Decord's platform metadata diagnostic; default PyAV path remains independently validated"
+  else
     printf '%s\n' "${check_output}" >&2
     die "installed Python dependencies are inconsistent"
   fi
 
-  log "pip reported the known Decord platform-tag false positive; running a real decode smoke test"
+  log "Running the patched Qwen PyAV keyframe decoder smoke test"
   "${VENV_PYTHON}" - <<'PY'
 import tempfile
 from pathlib import Path
 
 import av
-import decord
 import numpy as np
+import torch
 
-if decord.__version__ != "0.6.0":
-    raise SystemExit(f"unexpected Decord version: {decord.__version__}")
+from lmms_eval.models.model_utils.qwen2_5_vl_keyframe_vision_process import (
+    _read_video_pyav_keyframe,
+)
+from lmms_eval.models import get_model
 
-with tempfile.TemporaryDirectory(prefix="wfs-decord-smoke-") as directory:
-    video_path = Path(directory) / "one-frame.mp4"
+qwen_model_class = get_model("qwen2_5_vl")
+if qwen_model_class.__module__ != "lmms_eval.models.chat.qwen2_5_vl":
+    raise SystemExit(f"qwen2_5_vl did not resolve to the chat keyframe path: {qwen_model_class}")
+
+with tempfile.TemporaryDirectory(prefix="wfs-qwen-pyav-smoke-") as directory:
+    video_path = Path(directory) / "four-frames.mp4"
     with av.open(str(video_path), mode="w") as container:
         stream = container.add_stream("mpeg4", rate=4)
-        stream.width = 16
-        stream.height = 16
+        stream.width = 64
+        stream.height = 64
         stream.pix_fmt = "yuv420p"
         for index in range(4):
             frame = av.VideoFrame.from_ndarray(
-                np.full((16, 16, 3), index * 32, dtype=np.uint8),
+                np.full((64, 64, 3), index * 32, dtype=np.uint8),
                 format="rgb24",
             )
             for packet in stream.encode(frame):
@@ -485,14 +552,23 @@ with tempfile.TemporaryDirectory(prefix="wfs-decord-smoke-") as directory:
         for packet in stream.encode():
             container.mux(packet)
 
-    reader = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
-    frame_count = len(reader)
-    first_shape = tuple(reader[0].asnumpy().shape) if frame_count else None
-    if frame_count < 1 or first_shape != (16, 16, 3):
-        raise SystemExit(
-            "Decord runtime smoke returned invalid output: "
-            f"frame_count={frame_count}, first_shape={first_shape}"
-        )
+    video, metadata, sample_fps = _read_video_pyav_keyframe(
+        {"video": str(video_path)},
+        frame_idx=[0, 3],
+    )
+    with av.open(str(video_path), mode="r") as container:
+        decoded = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    expected = torch.from_numpy(np.stack([decoded[0], decoded[3]])).permute(0, 3, 1, 2)
+    if tuple(video.shape) != (2, 3, 64, 64) or video.dtype != torch.uint8:
+        raise SystemExit(f"invalid PyAV keyframe tensor: shape={tuple(video.shape)}, dtype={video.dtype}")
+    if not torch.equal(video.cpu(), expected):
+        raise SystemExit("PyAV keyframe helper did not return the exact requested source frames")
+    if metadata.get("video_backend") != "pyav":
+        raise SystemExit(f"unexpected keyframe backend metadata: {metadata}")
+    if metadata.get("frames_indices") != [0, 3] or metadata.get("total_num_frames") != 4:
+        raise SystemExit(f"invalid keyframe index metadata: {metadata}")
+    if not np.isfinite(sample_fps) or sample_fps <= 0:
+        raise SystemExit(f"invalid keyframe sample_fps: {sample_fps}")
 PY
 }
 
@@ -584,7 +660,6 @@ import platform
 
 modules = (
     "av",
-    "decord",
     "numpy",
     "PIL",
     "pywt",

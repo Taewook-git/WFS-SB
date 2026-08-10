@@ -481,7 +481,7 @@ class Llava_OneVision(lmms):
                         try:
                             if self.use_keyframe:
                                 frame_index = self.task_dict[task][split][batched_doc_id[0]]['keyframe_indices']
-                                frames = self.load_video_frame_idx(visual, self.max_frames_num, frame_index)  
+                                frames = self.load_video_frame_idx(visual, self.max_frames_num, frame_index)
                             else:
                                 if self.video_decode_backend == "decord":
                                     frames = self.load_video(visual, self.max_frames_num)

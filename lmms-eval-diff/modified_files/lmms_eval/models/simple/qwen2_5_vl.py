@@ -3,7 +3,6 @@ import re
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
-import decord
 import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType
@@ -26,6 +25,7 @@ from lmms_eval.models.model_utils.reasoning_model_utils import (
 
 try:
     from qwen_vl_utils import process_vision_info
+    from ..model_utils.qwen2_5_vl_keyframe_vision_process import process_vision_info_keyframe
 except ImportError:
     eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
 
@@ -62,7 +62,7 @@ class Qwen2_5_VL(lmms):
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
 
         self.use_keyframe = use_keyframe
-        
+
         # Validate attention implementation
         valid_attn_implementations = [None, "flash_attention_2", "sdpa", "eager"]
         if attn_implementation not in valid_attn_implementations:
@@ -241,10 +241,6 @@ class Qwen2_5_VL(lmms):
                 if visual_list[i] is not None:
                     for visual in visual_list[i]:
                         if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):  # Video file
-                            vr = decord.VideoReader(visual)
-                            first_frame = vr[0].asnumpy()
-                            height, width = first_frame.shape[:2]
-                            # max_pixels = height * width
                             processed_visuals.append({"type": "video", "video": visual, "max_pixels": self.max_pixels, "min_pixels": self.min_pixels})
                         elif isinstance(visual, Image.Image):  # Handle both single and multiple images
                             base64_image = visual.convert("RGB")
@@ -286,8 +282,22 @@ class Qwen2_5_VL(lmms):
                 batched_messages.append(message)
 
             texts = [self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batched_messages]
-            image_inputs, video_inputs = process_vision_info(batched_messages)
-            if video_inputs is not None:
+            keyframe_video_kwargs = {}
+            if self.use_keyframe:
+                frame_indices = [
+                    self.task_dict[task][split][current_doc_id]["keyframe_indices"]
+                    for current_doc_id in doc_id
+                ]
+                for current_indices in frame_indices:
+                    assert len(current_indices) == self.max_num_frames, f"Keyframe indices length {len(current_indices)} does not match max_frames_num {self.max_num_frames}."
+                image_inputs, video_inputs, keyframe_video_kwargs = process_vision_info_keyframe(
+                    batched_messages,
+                    frame_idx=frame_indices,
+                    return_video_kwargs=True,
+                )
+            else:
+                image_inputs, video_inputs = process_vision_info(batched_messages)
+            if video_inputs is not None and not self.use_keyframe:
                 total_frames = video_inputs[0].shape[0]
                 indices = np.linspace(0, total_frames - 1, self.max_num_frames, dtype=int)
                 # Ensure unique indices if linspace produces duplicates for few frames
@@ -297,7 +307,7 @@ class Qwen2_5_VL(lmms):
                     indices = np.append(indices, total_frames - 1)
                     indices = np.unique(indices)  # Ensure uniqueness again
                 video_inputs[0] = video_inputs[0][indices]
-            inputs = self.processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+            inputs = self.processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt", **keyframe_video_kwargs)
 
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")

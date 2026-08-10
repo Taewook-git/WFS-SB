@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 SCRIPT = Path(__file__).parents[1] / "scripts" / "bootstrap_a100.sh"
 
 
@@ -84,15 +83,35 @@ def test_bootstrap_contains_required_a100_and_dataset_checks() -> None:
         assert required in text
 
 
-def test_bootstrap_narrowly_handles_decord_pip_platform_false_positive() -> None:
+def test_bootstrap_narrowly_handles_decord_metadata_and_smokes_pyav_keyframes() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     assert '"${VENV_PYTHON}" -m pip check' in text
-    assert '"${check_output}" != "decord 0.6.0 is not supported on this platform"' in text
-    assert "decord.VideoReader" in text
-    assert 'decord.__version__ != "0.6.0"' in text
-    assert "frame_count < 1" in text
-    assert "frame_count={frame_count}, first_shape={first_shape}" in text
+    assert '"${check_output}" == "decord 0.6.0 is not supported on this platform"' in text
+    assert "_read_video_pyav_keyframe" in text
+    assert 'qwen_model_class.__module__ != "lmms_eval.models.chat.qwen2_5_vl"' in text
+    assert 'metadata.get("video_backend") != "pyav"' in text
+    assert 'metadata.get("frames_indices") != [0, 3]' in text
+    assert "torch.equal(video.cpu(), expected)" in text
+    assert '"decord",' not in text
     assert "installed Python dependencies are inconsistent" in text
+
+
+def test_bootstrap_only_migrates_the_exact_legacy_lmms_patch() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'LEGACY_LMMS_PATCH_ID="23eb590a95c58f878849e6d58e332a2728d4699a"' in text
+    assert "snapshot_lmms_worktree_patch" in text
+    assert "--untracked-files=all" in text
+    assert 'git patch-id --stable <"${legacy_diff}"' in text
+    assert '"${actual_id}" == "${LEGACY_LMMS_PATCH_ID}"' in text
+    assert 'diff --cached --quiet --' in text
+    assert "index contains staged changes; refusing legacy migration" in text
+    assert 'apply --reverse --check "${legacy_diff}"' in text
+    assert 'apply --reverse "${legacy_diff}"' in text
+    assert "was not clean after reversing the exact legacy patch" in text
+    assert "does not apply after legacy migration" in text
+    assert "git reset --hard" not in text
+    assert "git clean -fd" not in text
+    assert 'rm -rf -- "${LMMS_DIR}"' not in text
 
 
 @pytest.mark.skipif(BASH is None, reason="requires a native Bash runtime")

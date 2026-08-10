@@ -67,20 +67,29 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
                 video_kwargs["nframes"] = self.max_num_frames
             batched_messages = [chat_message.to_hf_messages(video_kwargs=video_kwargs) for chat_message in chat_messages]
             texts = [self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batched_messages]
+            keyframe_video_kwargs = {}
             if self.use_keyframe:
-                frame_idx = self.task_dict[task[0]][split[0]][doc_id[0]]['keyframe_indices']
-                assert len(frame_idx) == self.max_num_frames, f"Keyframe indices length {len(frame_idx)} does not match max_frames_num {self.max_num_frames}."
-                image_inputs, video_inputs = process_vision_info_keyframe(batched_messages, frame_idx=frame_idx)
+                frame_indices = [
+                    self.task_dict[current_task][current_split][current_doc_id]["keyframe_indices"]
+                    for current_doc_id, current_task, current_split in zip(doc_id, task, split)
+                ]
+                for current_indices in frame_indices:
+                    assert len(current_indices) == self.max_num_frames, f"Keyframe indices length {len(current_indices)} does not match max_frames_num {self.max_num_frames}."
+                image_inputs, video_inputs, keyframe_video_kwargs = process_vision_info_keyframe(
+                    batched_messages,
+                    frame_idx=frame_indices,
+                    return_video_kwargs=True,
+                )
             else:
                 image_inputs, video_inputs = process_vision_info(batched_messages)
-            if video_inputs is not None:
+            if video_inputs is not None and not self.use_keyframe:
                 total_frames = video_inputs[0].shape[0]
                 indices = np.linspace(0, total_frames - 1, self.max_num_frames, dtype=int)
                 # Append the last frame index if not already included
                 if total_frames - 1 not in indices:
                     indices = np.append(indices, total_frames - 1)
                 video_inputs[0] = video_inputs[0][indices]
-            inputs = self.processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+            inputs = self.processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt", **keyframe_video_kwargs)
 
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")
