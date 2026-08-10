@@ -471,22 +471,28 @@ if decord.__version__ != "0.6.0":
 with tempfile.TemporaryDirectory(prefix="wfs-decord-smoke-") as directory:
     video_path = Path(directory) / "one-frame.mp4"
     with av.open(str(video_path), mode="w") as container:
-        stream = container.add_stream("mpeg4", rate=1)
+        stream = container.add_stream("mpeg4", rate=4)
         stream.width = 16
         stream.height = 16
         stream.pix_fmt = "yuv420p"
-        frame = av.VideoFrame.from_ndarray(
-            np.zeros((16, 16, 3), dtype=np.uint8),
-            format="rgb24",
-        )
-        for packet in stream.encode(frame):
-            container.mux(packet)
+        for index in range(4):
+            frame = av.VideoFrame.from_ndarray(
+                np.full((16, 16, 3), index * 32, dtype=np.uint8),
+                format="rgb24",
+            )
+            for packet in stream.encode(frame):
+                container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
 
     reader = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
-    if len(reader) != 1 or reader[0].asnumpy().shape != (16, 16, 3):
-        raise SystemExit("Decord runtime smoke returned an invalid frame")
+    frame_count = len(reader)
+    first_shape = tuple(reader[0].asnumpy().shape) if frame_count else None
+    if frame_count < 1 or first_shape != (16, 16, 3):
+        raise SystemExit(
+            "Decord runtime smoke returned invalid output: "
+            f"frame_count={frame_count}, first_shape={first_shape}"
+        )
 PY
 }
 

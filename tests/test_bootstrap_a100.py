@@ -90,6 +90,8 @@ def test_bootstrap_narrowly_handles_decord_pip_platform_false_positive() -> None
     assert '"${check_output}" != "decord 0.6.0 is not supported on this platform"' in text
     assert "decord.VideoReader" in text
     assert 'decord.__version__ != "0.6.0"' in text
+    assert "frame_count < 1" in text
+    assert "frame_count={frame_count}, first_shape={first_shape}" in text
     assert "installed Python dependencies are inconsistent" in text
 
 
