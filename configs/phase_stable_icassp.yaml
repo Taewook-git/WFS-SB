@@ -1,0 +1,44 @@
+metadata:
+  protocol: icassp-ti-dwt-v1
+  primary_comparison: dwt_vs_swt
+  ti_variant: undecimated_swt_db4
+
+sampling:
+  master_seed: 20260810
+  num_origins: 5
+  sample_fps: 1.0
+  pts_backend: pyav
+  nearest_tie_break: earlier
+
+experiment:
+  methods: [dwt, swt]
+  wavelet: db4
+  level: null
+  drift_level: 3
+  frame_budget: 16
+  min_distance_ratio: 0.02
+  min_distance_absolute: 5
+  shared_padding: true
+  padding_mode: reflect
+  dwt_mode: symmetric
+  swt_norm: true
+  cycle_shifts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  cycle_aggregation: mean
+  gaussian_sigma: null
+  boundary_tolerance_sec: 1.0
+  report_boundary_tolerances_sec: [0.5, 1.0, 2.0]
+  selected_tolerance_sec: 1.0
+  # Use 0 for Stage-0 smoke tests. Set a pre-registered positive margin for
+  # the paper's valid-interior primary analysis after the pilot.
+  edge_margin_sec: 0.0
+
+selection:
+  height_factor: 0.5
+  prominence_factor: 0.05
+  w_duration: 0.4
+  w_mean: 0.2
+  w_max: 0.3
+  w_var: 0.1
+  strictness_factor: 1.2
+  temperature: 1.0
+  lambda_param: 0.5

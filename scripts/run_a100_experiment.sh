@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# One entry point: safe pull/setup -> optional data fetch -> Stage-0 -> MLLM grid -> evaluation.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+CALLER_DIR="$(pwd -P)"
+
+die() {
+  printf 'run_a100_experiment: ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/run_a100_experiment.sh [options]
+
+Default action: update this clean checkout, build/reuse the Python 3.10 venv,
+prompt for Hugging Face login if needed, obtain the first 20 VideoMME videos,
+run DWT/SWT Stage-0, run the 2 methods x 5 origins Qwen grid, merge official
+parser outputs, and compute the paired downstream summary.
+
+Core options:
+  --benchmark NAME          videomme (default), mlvu, or lvb
+  --dataset-root PATH       Benchmark root; defaults to repository datasets
+  --questions-file PATH     Annotation override
+  --run-dir PATH            Artifact root (default: artifacts/<benchmark>_stage0_20)
+  --config PATH             Phase-stable YAML (default: configs/phase_stable_icassp.yaml)
+  --seed N                  Sampling/bootstrap seed (default: 20260810)
+  --full                    Run every annotated video (10,000 bootstraps)
+  --video-count N           First N unique videos in pilot mode (default: 20)
+  --no-download-data        Do not fetch missing VideoMME archive chunks
+  --skip-bootstrap          Reuse an already prepared venv without Git pull/install
+  --skip-mllm               Stop after keyframe export
+  --include-baselines       Also run Uniform and Top-K through the MLLM
+
+Runtime options:
+  --venv-dir PATH           Venv (default: ~/.venvs/wfs-sb-a100)
+  --python PATH             Host Python 3.10 for bootstrap (default: python3.10)
+  --cuda-device ID          Physical GPU ID (default: 0)
+  --feature-model NAME      BLIP/CLIP extractor (default: blip2)
+  --feature-model-path P    Hub ID or local extractor checkpoint
+  --feature-batch-size N    BLIP inference batch (default: 32 for A100 80GB)
+  --frame-buffer-size N     Maximum decoded RGB frames in RAM (default: 256)
+  --qwen-checkpoint P       Hub ID/local Qwen path
+  --num-origins N           Sampling origins (default: 5)
+  --sample-fps F            Candidate sampling FPS (default: 1.0)
+  --frame-budget N          Selected frames per question (default: 16)
+  --run-matched             Also compute fixed-cardinality boundary metrics
+  --matched-count N         Boundary count for --run-matched (default: 4)
+  --mllm-limit N            Smoke-test limit passed to lmms-eval
+  --force-step NAME         Force a Stage-0 step; repeatable
+  --force-mllm              Re-run every MLLM grid cell
+  -h, --help                Show this help
+
+HF_TOKEN may be exported before launch, or omitted for a hidden interactive
+`hf auth login` prompt. It is never printed or forwarded to lmms-eval logs.
+Every expensive stage has provenance-aware completion markers, so rerunning the
+same command resumes completed work and rejects stale outputs.
+EOF
+}
+
+BENCHMARK="videomme"
+DATASET_ROOT=""
+QUESTIONS_FILE=""
+RUN_DIR=""
+CONFIG_FILE="${REPO_ROOT}/configs/phase_stable_icassp.yaml"
+SEED=20260810
+FULL_RUN=0
+VIDEO_COUNT=20
+DOWNLOAD_DATA=1
+RUN_BOOTSTRAP=1
+RUN_MLLM=1
+INCLUDE_BASELINES=0
+VENV_DIR="${WFS_VENV_DIR:-${HOME}/.venvs/wfs-sb-a100}"
+HOST_PYTHON="${WFS_PYTHON:-python3.10}"
+CUDA_DEVICE="0"
+FEATURE_MODEL="blip2"
+FEATURE_MODEL_PATH=""
+FEATURE_BATCH_SIZE=32
+FRAME_BUFFER_SIZE=256
+QWEN_CHECKPOINT="Qwen/Qwen2.5-VL-7B-Instruct"
+NUM_ORIGINS=5
+SAMPLE_FPS=1.0
+FRAME_BUDGET=16
+RUN_MATCHED=0
+MATCHED_COUNT=4
+MLLM_LIMIT=""
+declare -a FORCE_STEPS=()
+FORCE_MLLM=0
+
+need_value() {
+  [[ $# -ge 2 && -n "${2:-}" ]] || die "$1 requires a value"
+}
+
+while (($#)); do
+  case "$1" in
+    --benchmark) need_value "$@"; BENCHMARK="${2,,}"; shift 2 ;;
+    --dataset-root) need_value "$@"; DATASET_ROOT="$2"; shift 2 ;;
+    --questions-file) need_value "$@"; QUESTIONS_FILE="$2"; shift 2 ;;
+    --run-dir) need_value "$@"; RUN_DIR="$2"; shift 2 ;;
+    --config) need_value "$@"; CONFIG_FILE="$2"; shift 2 ;;
+    --seed) need_value "$@"; SEED="$2"; shift 2 ;;
+    --full) FULL_RUN=1; shift ;;
+    --video-count) need_value "$@"; VIDEO_COUNT="$2"; shift 2 ;;
+    --no-download-data) DOWNLOAD_DATA=0; shift ;;
+    --skip-bootstrap) RUN_BOOTSTRAP=0; shift ;;
+    --skip-mllm) RUN_MLLM=0; shift ;;
+    --include-baselines) INCLUDE_BASELINES=1; shift ;;
+    --venv-dir) need_value "$@"; VENV_DIR="$2"; shift 2 ;;
+    --python) need_value "$@"; HOST_PYTHON="$2"; shift 2 ;;
+    --cuda-device) need_value "$@"; CUDA_DEVICE="$2"; shift 2 ;;
+    --feature-model) need_value "$@"; FEATURE_MODEL="$2"; shift 2 ;;
+    --feature-model-path) need_value "$@"; FEATURE_MODEL_PATH="$2"; shift 2 ;;
+    --feature-batch-size) need_value "$@"; FEATURE_BATCH_SIZE="$2"; shift 2 ;;
+    --frame-buffer-size) need_value "$@"; FRAME_BUFFER_SIZE="$2"; shift 2 ;;
+    --qwen-checkpoint) need_value "$@"; QWEN_CHECKPOINT="$2"; shift 2 ;;
+    --num-origins) need_value "$@"; NUM_ORIGINS="$2"; shift 2 ;;
+    --sample-fps) need_value "$@"; SAMPLE_FPS="$2"; shift 2 ;;
+    --frame-budget) need_value "$@"; FRAME_BUDGET="$2"; shift 2 ;;
+    --run-matched) RUN_MATCHED=1; shift ;;
+    --matched-count) need_value "$@"; MATCHED_COUNT="$2"; RUN_MATCHED=1; shift 2 ;;
+    --mllm-limit) need_value "$@"; MLLM_LIMIT="$2"; shift 2 ;;
+    --force-step) need_value "$@"; FORCE_STEPS+=("$2"); shift 2 ;;
+    --force-mllm) FORCE_MLLM=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1 (use --help)" ;;
+  esac
+done
+
+case "$BENCHMARK" in
+  videomme)
+    DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/datasets/videomme}"
+    QUESTIONS_FILE="${QUESTIONS_FILE:-${DATASET_ROOT}/videomme_json_file.json}"
+    RAW_SUBDIR="data"
+    ;;
+  mlvu)
+    DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/datasets/mlvu}"
+    QUESTIONS_FILE="${QUESTIONS_FILE:-${DATASET_ROOT}/mlvu_dev.json}"
+    RAW_SUBDIR="video"
+    ;;
+  lvb|longvideobench)
+    BENCHMARK="lvb"
+    DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/datasets/longvideobench}"
+    QUESTIONS_FILE="${QUESTIONS_FILE:-${DATASET_ROOT}/lvb_val.json}"
+    RAW_SUBDIR="videos"
+    ;;
+  *) die "--benchmark must be videomme, mlvu, or lvb" ;;
+esac
+
+command -v realpath >/dev/null 2>&1 || die "realpath is required"
+if [[ "$DATASET_ROOT" != /* ]]; then DATASET_ROOT="$CALLER_DIR/$DATASET_ROOT"; fi
+if [[ "$QUESTIONS_FILE" != /* ]]; then QUESTIONS_FILE="$CALLER_DIR/$QUESTIONS_FILE"; fi
+if [[ "$VENV_DIR" != /* ]]; then VENV_DIR="$CALLER_DIR/$VENV_DIR"; fi
+if [[ "$CONFIG_FILE" != /* ]]; then CONFIG_FILE="$CALLER_DIR/$CONFIG_FILE"; fi
+DATASET_ROOT="$(realpath -m -- "$DATASET_ROOT")"
+QUESTIONS_FILE="$(realpath -m -- "$QUESTIONS_FILE")"
+VENV_DIR="$(realpath -m -- "$VENV_DIR")"
+CONFIG_FILE="$(realpath -m -- "$CONFIG_FILE")"
+if [[ -n "$FEATURE_MODEL_PATH" && -e "$FEATURE_MODEL_PATH" ]]; then
+  FEATURE_MODEL_PATH="$(realpath -- "$FEATURE_MODEL_PATH")"
+fi
+if [[ -e "$QWEN_CHECKPOINT" ]]; then
+  QWEN_CHECKPOINT="$(realpath -- "$QWEN_CHECKPOINT")"
+fi
+
+[[ "$VIDEO_COUNT" =~ ^[1-9][0-9]*$ ]] || die "--video-count must be positive"
+[[ "$SEED" =~ ^[0-9]+$ ]] || die "--seed must be a non-negative integer"
+for value in "$FEATURE_BATCH_SIZE" "$FRAME_BUFFER_SIZE" "$NUM_ORIGINS" "$FRAME_BUDGET" "$MATCHED_COUNT"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "integer runtime options must be positive"
+done
+[[ -f "$QUESTIONS_FILE" ]] || die "questions file not found: $QUESTIONS_FILE"
+[[ -f "$CONFIG_FILE" ]] || die "config file not found: $CONFIG_FILE"
+
+if [[ -z "$RUN_DIR" ]]; then
+  if ((FULL_RUN)); then
+    RUN_DIR="${REPO_ROOT}/artifacts/${BENCHMARK}_full"
+  else
+    RUN_DIR="${REPO_ROOT}/artifacts/${BENCHMARK}_stage0_${VIDEO_COUNT}"
+  fi
+fi
+if [[ "$RUN_DIR" != /* ]]; then RUN_DIR="$CALLER_DIR/$RUN_DIR"; fi
+RUN_DIR="$(realpath -m -- "$RUN_DIR")"
+
+if ((RUN_BOOTSTRAP)); then
+  bootstrap_args=(
+    --python "$HOST_PYTHON"
+    --venv-dir "$VENV_DIR"
+    --datasets "$BENCHMARK"
+    --dataset-check paths
+  )
+  case "$BENCHMARK" in
+    videomme) bootstrap_args+=(--videomme-root "$DATASET_ROOT") ;;
+    mlvu) bootstrap_args+=(--mlvu-root "$DATASET_ROOT") ;;
+    lvb) bootstrap_args+=(--lvb-root "$DATASET_ROOT") ;;
+  esac
+  bash "${SCRIPT_DIR}/bootstrap_a100.sh" "${bootstrap_args[@]}"
+fi
+
+[[ -x "$VENV_DIR/bin/python" ]] || die "venv is not ready: $VENV_DIR"
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+PYTHON_BIN="$VENV_DIR/bin/python"
+
+# Keep the checked-in protocol immutable. For a K ablation, create a run-local
+# config whose experiment.frame_budget matches the requested export/MLLM budget.
+mkdir -p -- "$RUN_DIR"
+EFFECTIVE_CONFIG="$("$PYTHON_BIN" - "$CONFIG_FILE" "$RUN_DIR" "$FRAME_BUDGET" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+source = Path(sys.argv[1])
+run_dir = Path(sys.argv[2])
+budget = int(sys.argv[3])
+payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+if not isinstance(payload, dict) or not isinstance(payload.get("experiment"), dict):
+    raise SystemExit(f"invalid phase-stable config: {source}")
+if payload["experiment"].get("frame_budget") == budget:
+    print(source.resolve())
+else:
+    payload["experiment"]["frame_budget"] = budget
+    destination = run_dir / "effective_phase_stable_config.yaml"
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+    print(destination.resolve())
+PY
+)"
+
+if ((DOWNLOAD_DATA)) && [[ "$BENCHMARK" == "videomme" ]]; then
+  fetch_count="$VIDEO_COUNT"
+  ((FULL_RUN)) && fetch_count=0
+  bash "${SCRIPT_DIR}/fetch_videomme.sh" \
+    --dataset-root "$DATASET_ROOT" \
+    --questions-file "$QUESTIONS_FILE" \
+    --video-count "$fetch_count"
+fi
+
+# The pinned lmms-eval patch resolves raw videos under ./datasets/<benchmark>.
+# Link only that ignored raw-data leaf when preprocessing uses an external mount.
+actual_raw="$(cd -- "$DATASET_ROOT" && pwd -P)/$RAW_SUBDIR"
+case "$BENCHMARK" in
+  videomme) expected_raw="${REPO_ROOT}/datasets/videomme/data" ;;
+  mlvu) expected_raw="${REPO_ROOT}/datasets/mlvu/video" ;;
+  lvb) expected_raw="${REPO_ROOT}/datasets/longvideobench/videos" ;;
+esac
+[[ -d "$actual_raw" ]] || die "raw-video directory not found: $actual_raw"
+if [[ "$actual_raw" != "$expected_raw" ]]; then
+  if [[ -L "$expected_raw" ]]; then
+    [[ "$(readlink -f -- "$expected_raw")" == "$(readlink -f -- "$actual_raw")" ]] || \
+      die "existing raw-data symlink points elsewhere: $expected_raw"
+  elif [[ -d "$expected_raw" ]]; then
+    [[ -z "$(find "$expected_raw" -mindepth 1 -maxdepth 1 -print -quit)" ]] || \
+      die "refusing to replace non-empty raw-data directory: $expected_raw"
+    rmdir -- "$expected_raw"
+    ln -s -- "$actual_raw" "$expected_raw"
+  elif [[ ! -e "$expected_raw" ]]; then
+    ln -s -- "$actual_raw" "$expected_raw"
+  else
+    die "raw-data compatibility path is not a directory/symlink: $expected_raw"
+  fi
+fi
+
+export CUDA_VISIBLE_DEVICES="$CUDA_DEVICE"
+stage_args=(
+  --benchmark "$BENCHMARK"
+  --questions-file "$QUESTIONS_FILE"
+  --dataset-root "$DATASET_ROOT"
+  --run-dir "$RUN_DIR"
+  --config "$EFFECTIVE_CONFIG"
+  --seed "$SEED"
+  --num-origins "$NUM_ORIGINS"
+  --sample-fps "$SAMPLE_FPS"
+  --frame-budget "$FRAME_BUDGET"
+  --feature-model "$FEATURE_MODEL"
+  --device cuda:0
+  --batch-size "$FEATURE_BATCH_SIZE"
+  --frame-buffer-size "$FRAME_BUFFER_SIZE"
+  --python "$PYTHON_BIN"
+)
+if ((FULL_RUN)); then
+  stage_args+=(--full --bootstrap 10000)
+else
+  stage_args+=(--bootstrap 1000 --video-indices)
+  for ((index = 0; index < VIDEO_COUNT; index++)); do stage_args+=("$index"); done
+fi
+[[ -z "$FEATURE_MODEL_PATH" ]] || stage_args+=(--model-path "$FEATURE_MODEL_PATH")
+((RUN_MATCHED == 0)) || stage_args+=(--matched-count "$MATCHED_COUNT")
+for force_step in "${FORCE_STEPS[@]}"; do stage_args+=(--force-step "$force_step"); done
+
+bash "${SCRIPT_DIR}/run_stage0.sh" "${stage_args[@]}"
+
+if ((RUN_MLLM == 0)); then
+  printf 'A100 experiment stopped after Stage-0 as requested: %s\n' "$RUN_DIR"
+  exit 0
+fi
+
+origins_csv=""
+for ((origin = 0; origin < NUM_ORIGINS; origin++)); do
+  origins_csv+="${origins_csv:+,}${origin}"
+done
+predictions_path="${RUN_DIR}/predictions.jsonl"
+mllm_args=(
+  --benchmark "$BENCHMARK"
+  --keyframe-dir "${RUN_DIR}/keyframes"
+  --output-root "${RUN_DIR}/mllm"
+  --methods dwt,swt
+  --origins "$origins_csv"
+  --qwen-checkpoint "$QWEN_CHECKPOINT"
+  --cuda-device "$CUDA_DEVICE"
+  --max-num-frames "$FRAME_BUDGET"
+  --attention sdpa
+  --batch-size 1
+  --python-bin "$PYTHON_BIN"
+  --converter-python "$PYTHON_BIN"
+  --repo-root "$REPO_ROOT"
+  --predictions-output "$predictions_path"
+)
+((INCLUDE_BASELINES == 0)) || mllm_args+=(--include-baselines)
+[[ -z "$MLLM_LIMIT" ]] || mllm_args+=(--limit "$MLLM_LIMIT")
+((FORCE_MLLM == 0)) || mllm_args+=(--force)
+bash "${SCRIPT_DIR}/run_mllm_grid.sh" "${mllm_args[@]}"
+
+bootstrap_repetitions=1000
+((FULL_RUN == 0)) || bootstrap_repetitions=10000
+summary_path="${RUN_DIR}/mllm_stability_summary.json"
+"$PYTHON_BIN" -m phase_stable evaluate-predictions \
+  "$predictions_path" "$summary_path" \
+  --baseline-method dwt \
+  --treatment-method swt \
+  --n-bootstrap "$bootstrap_repetitions" \
+  --confidence 0.95 \
+  --seed "$SEED"
+
+printf '\nA100 experiment complete.\n'
+printf '  Stage/trace artifacts: %s\n' "$RUN_DIR"
+printf '  Predictions:          %s\n' "$predictions_path"
+printf '  MLLM stability:       %s\n' "$summary_path"

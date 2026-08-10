@@ -5,6 +5,8 @@ __pycache__/
 
 outputs/
 results/*
+artifacts/
+.pytest_cache/
 lmms-eval/
 
 *.pkl
@@ -13,8 +15,11 @@ lmms-eval/
 *.safetensors
 *.whl
 *.sh
+!scripts/*.sh
 
 .vscode
+*.env.a100
+datasets/*/.archives/
 datasets/*/blip2_features_and_scores*
 datasets/*/video
 datasets/*/videos
