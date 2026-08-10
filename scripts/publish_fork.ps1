@@ -16,6 +16,21 @@ function Invoke-Native {
     }
 }
 
+function Test-NativeCommand {
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(ValueFromRemainingArguments)][string[]]$Arguments
+    )
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $Command @Arguments *> $null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
 
@@ -30,8 +45,7 @@ if ($LASTEXITCODE -ne 0 -or $inside -ne "true") {
     throw "Not inside a Git worktree: $RepoRoot"
 }
 
-& gh auth status --hostname github.com *> $null
-$isAuthenticated = $LASTEXITCODE -eq 0
+$isAuthenticated = Test-NativeCommand gh auth status --hostname github.com
 if (-not $isAuthenticated) {
     Write-Host "GitHub browser authentication is required. No token is printed or stored by this script."
     Invoke-Native gh auth login --hostname github.com --git-protocol https --web
@@ -86,17 +100,21 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($login)) {
     throw "Could not determine the authenticated GitHub username."
 }
 $forkUrl = "https://github.com/$login/WFS-SB.git"
-$forkRemote = (& git remote get-url fork 2>$null)
-if ($LASTEXITCODE -ne 0) {
+$remoteNames = @(& git remote)
+if ($remoteNames -notcontains "fork") {
     $repoExists = $true
-    & gh repo view "$login/WFS-SB" --json nameWithOwner *> $null
-    if ($LASTEXITCODE -ne 0) { $repoExists = $false }
+    if (-not (Test-NativeCommand gh repo view "$login/WFS-SB" --json nameWithOwner)) {
+        $repoExists = $false
+    }
     if (-not $repoExists) {
         Invoke-Native gh repo fork MAC-AutoML/WFS-SB --clone=false
     }
     Invoke-Native git remote add fork $forkUrl
-} elseif ($forkRemote.Trim() -ne $forkUrl) {
+} else {
+    $forkRemote = (& git remote get-url fork).Trim()
+    if ($forkRemote -ne $forkUrl) {
     throw "Remote 'fork' points to '$($forkRemote.Trim())', expected '$forkUrl'."
+    }
 }
 
 Invoke-Native git push --set-upstream fork $Branch
