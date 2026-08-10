@@ -7,6 +7,8 @@ outputs/
 results/*
 artifacts/
 .pytest_cache/
+/a100_experiment*.log
+/a100_full_experiment*.log
 lmms-eval/
 
 *.pkl
