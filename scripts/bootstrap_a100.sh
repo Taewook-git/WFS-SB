@@ -440,7 +440,57 @@ log "Installing patched lmms-eval in editable mode"
 "${VENV_PYTHON}" -m pip install -e "${LMMS_DIR}"
 log "Ensuring the official Hugging Face 'hf' CLI is installed"
 "${VENV_PYTHON}" -m pip install --upgrade "huggingface_hub[cli]>=0.35,<1"
-"${VENV_PYTHON}" -m pip check
+
+validate_installed_dependencies() {
+  local check_output
+  if check_output="$("${VENV_PYTHON}" -m pip check 2>&1)"; then
+    [[ -z "${check_output}" ]] || printf '%s\n' "${check_output}"
+    return
+  fi
+
+  # Recent pip releases can falsely reject an installed platform wheel during
+  # `pip check`. Permit only the known Decord 0.6.0 diagnostic, then replace
+  # the metadata-only verdict with an actual encode/decode runtime smoke test.
+  if [[ "${check_output}" != "decord 0.6.0 is not supported on this platform" ]]; then
+    printf '%s\n' "${check_output}" >&2
+    die "installed Python dependencies are inconsistent"
+  fi
+
+  log "pip reported the known Decord platform-tag false positive; running a real decode smoke test"
+  "${VENV_PYTHON}" - <<'PY'
+import tempfile
+from pathlib import Path
+
+import av
+import decord
+import numpy as np
+
+if decord.__version__ != "0.6.0":
+    raise SystemExit(f"unexpected Decord version: {decord.__version__}")
+
+with tempfile.TemporaryDirectory(prefix="wfs-decord-smoke-") as directory:
+    video_path = Path(directory) / "one-frame.mp4"
+    with av.open(str(video_path), mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=1)
+        stream.width = 16
+        stream.height = 16
+        stream.pix_fmt = "yuv420p"
+        frame = av.VideoFrame.from_ndarray(
+            np.zeros((16, 16, 3), dtype=np.uint8),
+            format="rgb24",
+        )
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+    reader = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
+    if len(reader) != 1 or reader[0].asnumpy().shape != (16, 16, 3):
+        raise SystemExit("Decord runtime smoke returned an invalid frame")
+PY
+}
+
+validate_installed_dependencies
 
 authenticate_hugging_face() {
   local hf_cli="${VENV_DIR}/bin/hf"

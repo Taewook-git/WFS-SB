@@ -84,6 +84,15 @@ def test_bootstrap_contains_required_a100_and_dataset_checks() -> None:
         assert required in text
 
 
+def test_bootstrap_narrowly_handles_decord_pip_platform_false_positive() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert '"${VENV_PYTHON}" -m pip check' in text
+    assert '"${check_output}" != "decord 0.6.0 is not supported on this platform"' in text
+    assert "decord.VideoReader" in text
+    assert 'decord.__version__ != "0.6.0"' in text
+    assert "installed Python dependencies are inconsistent" in text
+
+
 @pytest.mark.skipif(BASH is None, reason="requires a native Bash runtime")
 def test_bootstrap_bash_syntax_and_help_are_side_effect_free() -> None:
     syntax = subprocess.run(
