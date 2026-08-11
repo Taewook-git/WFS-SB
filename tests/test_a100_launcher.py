@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "scripts" / "run_a100_experiment.sh"
 FETCHER = REPO_ROOT / "scripts" / "fetch_videomme.sh"
@@ -56,6 +55,9 @@ def test_launcher_documents_and_chains_the_complete_default_run() -> None:
     positions = [source.index(value) for value in ordered_calls]
     assert positions == sorted(positions)
     assert 'payload["experiment"]["frame_budget"] = budget' in source
+    assert "--qwen-max-pixels N" in result.stdout
+    assert "QWEN_MAX_PIXELS=200704" in source
+    assert '--max-pixels "$QWEN_MAX_PIXELS"' in source
     assert "HF_TOKEN" not in source or "printf 'HF_TOKEN" not in source
 
 

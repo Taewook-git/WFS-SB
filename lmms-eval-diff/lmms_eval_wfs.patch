@@ -131,7 +131,7 @@ index 97c675d4..205ddc35 100644
                  inputs = inputs.to("cuda")
 diff --git a/lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py b/lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py
 new file mode 100644
-index 00000000..863fca69
+index 00000000..c3ad2ac4
 --- /dev/null
 +++ b/lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py
 @@ -0,0 +1,376 @@
@@ -504,7 +504,7 @@ index 00000000..863fca69
 +    if not video_inputs:
 +        video_inputs = None
 +
-+    video_kwargs = {"do_sample_frames": False}
++    video_kwargs = {}
 +    if not return_video_metadata:  # Backward compatibility for Qwen2.5-VL.
 +        video_kwargs["fps"] = video_sample_fps_list
 +

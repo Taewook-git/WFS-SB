@@ -367,7 +367,7 @@ def process_vision_info_keyframe(
     if not video_inputs:
         video_inputs = None
 
-    video_kwargs = {"do_sample_frames": False}
+    video_kwargs = {}
     if not return_video_metadata:  # Backward compatibility for Qwen2.5-VL.
         video_kwargs["fps"] = video_sample_fps_list
 

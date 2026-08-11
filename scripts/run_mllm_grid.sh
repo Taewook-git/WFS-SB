@@ -34,7 +34,7 @@ Model/runtime options:
   --qwen-checkpoint ID   Qwen checkpoint (default: Qwen/Qwen2.5-VL-7B-Instruct)
   --cuda-device ID       Physical CUDA_VISIBLE_DEVICES value (default: 0)
   --max-num-frames N     Must match export budget (default: 16)
-  --max-pixels N         Qwen per-visual maximum (default: 12845056)
+  --max-pixels N         Qwen per-frame maximum (default: 200704 = 256 visual tokens)
   --attention NAME       sdpa, flash_attention_2, or eager (default: sdpa)
   --batch-size N         lmms-eval batch size (default: 1)
   --python-bin COMMAND   Python executable (default: python)
@@ -300,7 +300,11 @@ SPLIT_OVERRIDE=""
 QWEN_CHECKPOINT="Qwen/Qwen2.5-VL-7B-Instruct"
 CUDA_DEVICE="0"
 MAX_NUM_FRAMES="16"
-MAX_PIXELS="12845056"
+# 256 * 28 * 28 is Qwen's documented lower-cost visual-token setting.  It
+# keeps 16-frame SDPA inference inside a 40 GiB A100 MIG slice; the checkpoint
+# default can make Transformers 4.49 materialize an attention problem large
+# enough to OOM before the first answer.
+MAX_PIXELS="200704"
 ATTENTION="sdpa"
 BATCH_SIZE="1"
 PYTHON_BIN="python"

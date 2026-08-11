@@ -119,6 +119,7 @@ def test_help_and_dry_run_show_benchmark_mapping_without_writes(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     assert "--tasks videomme" in result.stdout
     assert "use_keyframe=True" in result.stdout
+    assert "max_pixels=200704" in result.stdout
     assert 'test' in result.stdout
     assert "env -u HF_TOKEN" in result.stdout
     assert not output.exists()

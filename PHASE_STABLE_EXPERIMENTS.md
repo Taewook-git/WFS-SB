@@ -312,7 +312,7 @@ $Methods = @("uniform", "topk", "dwt", "swt")
 $Task = "videomme"
 $Split = "test"
 $RelativeKeyframeDir = "keyframe_dir/phase_stable_stage0_20"
-$ModelArgs = "max_num_frames=16,use_keyframe=True,pretrained=$env:QWEN_CKPT,max_pixels=12845056,attn_implementation=sdpa,interleave_visuals=False"
+$ModelArgs = "max_num_frames=16,use_keyframe=True,pretrained=$env:QWEN_CKPT,max_pixels=200704,attn_implementation=sdpa,interleave_visuals=False"
 
 foreach ($Method in $Methods) {
   foreach ($Origin in 0..4) {
@@ -336,6 +336,11 @@ foreach ($Method in $Methods) {
   }
 }
 ```
+
+`200704 = 256 × 28²`는 Qwen의 256 visual-token 설정이다. 16-frame
+SDPA를 40 GiB A100 MIG에서 실행할 때 모든 method/origin cell에 이 값을
+고정한다. 더 큰 spatial cap은 Transformers 4.49 vision SDPA의 dense
+attention 메모리를 크게 늘리므로, 한 run 안에서 값을 혼용하지 않는다.
 
 이 명령은 WFS-SB patch의 local task YAML이 저장소 루트의 `datasets/...`를 찾으므로 반드시 저장소 루트에서 실행한다. `sdpa` 대신 FlashAttention 2를 쓰려면 호환 wheel을 별도 설치한 뒤 `attn_implementation=flash_attention_2`로 바꾼다. 모든 cell에서 checkpoint, model args, task, prompt와 decoding 설정을 동일하게 유지한다.
 

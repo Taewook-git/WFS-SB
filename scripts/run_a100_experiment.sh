@@ -45,6 +45,7 @@ Runtime options:
   --feature-batch-size N    BLIP inference batch (default: 32 for A100 80GB)
   --frame-buffer-size N     Maximum decoded RGB frames in RAM (default: 256)
   --qwen-checkpoint P       Hub ID/local Qwen path
+  --qwen-max-pixels N       Per-frame Qwen limit (default: 200704; 40GB-safe)
   --num-origins N           Sampling origins (default: 5)
   --sample-fps F            Candidate sampling FPS (default: 1.0)
   --frame-budget N          Selected frames per question (default: 16)
@@ -82,6 +83,7 @@ FEATURE_MODEL_PATH=""
 FEATURE_BATCH_SIZE=32
 FRAME_BUFFER_SIZE=256
 QWEN_CHECKPOINT="Qwen/Qwen2.5-VL-7B-Instruct"
+QWEN_MAX_PIXELS=200704
 NUM_ORIGINS=5
 SAMPLE_FPS=1.0
 FRAME_BUDGET=16
@@ -117,6 +119,7 @@ while (($#)); do
     --feature-batch-size) need_value "$@"; FEATURE_BATCH_SIZE="$2"; shift 2 ;;
     --frame-buffer-size) need_value "$@"; FRAME_BUFFER_SIZE="$2"; shift 2 ;;
     --qwen-checkpoint) need_value "$@"; QWEN_CHECKPOINT="$2"; shift 2 ;;
+    --qwen-max-pixels) need_value "$@"; QWEN_MAX_PIXELS="$2"; shift 2 ;;
     --num-origins) need_value "$@"; NUM_ORIGINS="$2"; shift 2 ;;
     --sample-fps) need_value "$@"; SAMPLE_FPS="$2"; shift 2 ;;
     --frame-budget) need_value "$@"; FRAME_BUDGET="$2"; shift 2 ;;
@@ -168,7 +171,7 @@ fi
 
 [[ "$VIDEO_COUNT" =~ ^[1-9][0-9]*$ ]] || die "--video-count must be positive"
 [[ "$SEED" =~ ^[0-9]+$ ]] || die "--seed must be a non-negative integer"
-for value in "$FEATURE_BATCH_SIZE" "$FRAME_BUFFER_SIZE" "$NUM_ORIGINS" "$FRAME_BUDGET" "$MATCHED_COUNT"; do
+for value in "$FEATURE_BATCH_SIZE" "$FRAME_BUFFER_SIZE" "$QWEN_MAX_PIXELS" "$NUM_ORIGINS" "$FRAME_BUDGET" "$MATCHED_COUNT"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "integer runtime options must be positive"
 done
 [[ -f "$QUESTIONS_FILE" ]] || die "questions file not found: $QUESTIONS_FILE"
@@ -317,6 +320,7 @@ mllm_args=(
   --qwen-checkpoint "$QWEN_CHECKPOINT"
   --cuda-device "$CUDA_DEVICE"
   --max-num-frames "$FRAME_BUDGET"
+  --max-pixels "$QWEN_MAX_PIXELS"
   --attention sdpa
   --batch-size 1
   --python-bin "$PYTHON_BIN"

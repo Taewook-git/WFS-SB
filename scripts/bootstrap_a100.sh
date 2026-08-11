@@ -7,10 +7,13 @@ readonly DEFAULT_REPO_URL="https://github.com/MAC-AutoML/WFS-SB.git"
 readonly DEFAULT_REPO_BRANCH="main"
 readonly DEFAULT_LMMS_URL="https://github.com/EvolvingLMMs-Lab/lmms-eval.git"
 readonly LMMS_COMMIT="bb1ebe76e7a942386c25c4664f902e0e59e8a401"
-# Exact stable patch-id of lmms_eval_wfs.patch shipped through d19ab45.  This
-# permits a one-time, content-verified upgrade of an already bootstrapped
-# generated checkout without discarding arbitrary local work.
-readonly LEGACY_LMMS_PATCH_ID="23eb590a95c58f878849e6d58e332a2728d4699a"
+# Exact stable patch-ids previously shipped by this branch.  These permit a
+# content-verified upgrade of an already bootstrapped generated checkout
+# without discarding arbitrary local work.
+readonly -a LEGACY_LMMS_PATCH_IDS=(
+  "23eb590a95c58f878849e6d58e332a2728d4699a" # through d19ab45
+  "fc590b52df6e2503459240599de737716865ab30" # d1655f0
+)
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 EMBEDDED_REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
@@ -413,7 +416,8 @@ validate_exact_lmms_patch() {
 }
 
 migrate_exact_legacy_lmms_patch() {
-  local status_entry path actual_id legacy_diff
+  local status_entry path actual_id legacy_diff legacy_id
+  local legacy_match=0
   local -a expected_paths=()
   local -A expected_lookup=()
 
@@ -439,7 +443,13 @@ migrate_exact_legacy_lmms_patch() {
   TEMP_PATHS+=("${legacy_diff}")
   snapshot_lmms_worktree_patch "${legacy_diff}" "${expected_paths[@]}"
   actual_id="$(git patch-id --stable <"${legacy_diff}" | awk 'NR == 1 {print $1}')"
-  [[ -n "${actual_id}" && "${actual_id}" == "${LEGACY_LMMS_PATCH_ID}" ]] || \
+  for legacy_id in "${LEGACY_LMMS_PATCH_IDS[@]}"; do
+    if [[ -n "${actual_id}" && "${actual_id}" == "${legacy_id}" ]]; then
+      legacy_match=1
+      break
+    fi
+  done
+  [[ "${legacy_match}" == 1 ]] || \
     die "lmms-eval has changes that are neither the current nor the exact legacy WFS patch"
 
   git -C "${LMMS_DIR}" apply --reverse --check "${legacy_diff}" >/dev/null 2>&1 || \

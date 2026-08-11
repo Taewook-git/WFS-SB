@@ -156,6 +156,8 @@ def test_qwen_paths_preserve_keyframes_without_decord_resampling() -> None:
         assert "if video_inputs is not None and not self.use_keyframe" in source
     assert "import decord" not in simple
     assert "from decord" not in protocol
+    assert 'video_kwargs = {}' in HELPER.read_text(encoding="utf-8")
+    assert "do_sample_frames" not in HELPER.read_text(encoding="utf-8")
 
 
 def test_distributed_patch_contains_the_verified_pyav_path() -> None:

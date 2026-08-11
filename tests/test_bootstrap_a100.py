@@ -98,11 +98,13 @@ def test_bootstrap_narrowly_handles_decord_metadata_and_smokes_pyav_keyframes() 
 
 def test_bootstrap_only_migrates_the_exact_legacy_lmms_patch() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
-    assert 'LEGACY_LMMS_PATCH_ID="23eb590a95c58f878849e6d58e332a2728d4699a"' in text
+    assert 'LEGACY_LMMS_PATCH_IDS=(' in text
+    assert '"23eb590a95c58f878849e6d58e332a2728d4699a"' in text
+    assert '"fc590b52df6e2503459240599de737716865ab30"' in text
     assert "snapshot_lmms_worktree_patch" in text
     assert "--untracked-files=all" in text
     assert 'git patch-id --stable <"${legacy_diff}"' in text
-    assert '"${actual_id}" == "${LEGACY_LMMS_PATCH_ID}"' in text
+    assert '"${actual_id}" == "${legacy_id}"' in text
     assert 'diff --cached --quiet --' in text
     assert "index contains staged changes; refusing legacy migration" in text
     assert 'apply --reverse --check "${legacy_diff}"' in text
