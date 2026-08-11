@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from phase_stable.pipeline import PhaseStableWFS
+from phase_stable.pipeline import PhaseStableWFS, select_top_nms_indices
 from phase_stable.transforms import TransformConfig, build_transform
 from wfs.core import WFS, WFSConfig
 
@@ -96,3 +96,34 @@ def test_trace_is_json_friendly() -> None:
     assert payload["transform"]["method"] == "swt"
     assert len(payload["representation"]) == 4
     assert len(payload["selected_indices"]) == 16
+
+
+def test_top_nms_indices_is_exact_deterministic_and_excludes_endpoints() -> None:
+    values = np.array([99.0, 3.0, 3.0, 1.0, 8.0, 2.0, 7.0, 99.0])
+    selected = select_top_nms_indices(values, count=3, min_distance=2)
+    np.testing.assert_array_equal(selected, [1, 4, 6])
+
+
+def test_top_nms_indices_finds_feasible_exact_set_that_greedy_misses() -> None:
+    # Greedy selection starts at index 2 and cannot add another point at d=3,
+    # although the exact feasible pair (1, 4) exists.
+    values = np.array([0.0, 4.0, 10.0, 1.0, 4.0, 0.0])
+    selected = select_top_nms_indices(values, count=2, min_distance=3)
+    np.testing.assert_array_equal(selected, [1, 4])
+
+
+@pytest.mark.parametrize("method", ["dwt", "swt"])
+def test_matched_boundary_count_reuses_unchanged_selection_pipeline(method: str) -> None:
+    signal = _piecewise_signal(256)
+    transform = build_transform(TransformConfig(method=method, level=4))
+    trace = PhaseStableWFS(transform).run(
+        signal,
+        num_frames=16,
+        min_peak_distance=5,
+        boundary_count=4,
+    )
+    assert len(trace.peaks) == 4
+    assert len(trace.segments) == 5
+    assert len(trace.selected_indices) == 16
+    assert trace.peaks[0] > 0
+    assert trace.peaks[-1] < signal.size - 1

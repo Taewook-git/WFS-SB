@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from phase_stable.analysis import (
     ExperimentConfig,
@@ -8,6 +9,7 @@ from phase_stable.analysis import (
     compute_matched_cardinality_metrics,
     controlled_shift_metrics,
     evaluate_prediction_rows,
+    run_matched_selection_experiment,
     run_real_origin_experiment,
 )
 from phase_stable.artifacts import OriginSignalRecord
@@ -121,3 +123,43 @@ def test_constant_signal_is_reported_as_degenerate_without_crashing(tmp_path: Pa
     assert len(metrics) == 2
     assert all(row["saliency_zero_origin_rate"] >= 0 for row in metrics)
     assert all("saliency_temporal_variance_mean" in row for row in metrics)
+
+
+def test_matched_selection_writes_distinct_exact_count_traces(tmp_path: Path) -> None:
+    config = ExperimentConfig(
+        methods=("dwt", "swt"),
+        level=3,
+        frame_budget=8,
+        min_distance_absolute=3,
+    )
+    traces, metrics = run_matched_selection_experiment(
+        _records(), tmp_path, 4, config=config
+    )
+    assert len(traces) == 6
+    assert len(metrics) == 2
+    assert {row["method"] for row in traces} == {"dwt_matched", "swt_matched"}
+    assert {row["base_method"] for row in traces} == {"dwt", "swt"}
+    assert all(len(row["peaks"]) == 4 for row in traces)
+    assert all(len(row["segments"]) == 5 for row in traces)
+    assert all(row["matched_boundary_count"] == 4 for row in traces)
+    assert all(row["boundary_policy"]["count_source"] == "fixed" for row in traces)
+    assert all(len(row["selected_indices"]) == 8 for row in traces)
+
+
+def test_matched_selection_accepts_only_calibrated_video_count_mapping(
+    tmp_path: Path,
+) -> None:
+    config = ExperimentConfig(
+        methods=("dwt", "swt"), level=3, frame_budget=8, min_distance_absolute=3
+    )
+    traces, _ = run_matched_selection_experiment(
+        _records(), tmp_path / "mapped", {"video-1": 3}, config=config
+    )
+    assert all(len(row["peaks"]) == 3 for row in traces)
+    assert all(
+        row["boundary_policy"]["count_source"] == "counts_json" for row in traces
+    )
+    with pytest.raises(ValueError, match="no calibrated boundary count"):
+        run_matched_selection_experiment(
+            _records(), tmp_path / "missing", {"another-video": 3}, config=config
+        )

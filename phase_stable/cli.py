@@ -21,19 +21,20 @@ from .analysis import (
     controlled_shift_metrics,
     evaluate_prediction_rows,
     paired_metric_bootstrap,
+    run_matched_selection_experiment,
     run_real_origin_experiment,
 )
 from .artifacts import iter_jsonl, read_signal_records
+from .baselines import run_selection_baselines
 from .benchmarks import (
     build_benchmark_manifests,
     load_benchmark_videos,
     preprocess_benchmark_to_jsonl,
 )
-from .baselines import run_selection_baselines
 from .config import load_phase_stable_config
 from .export import export_trace_jsonl
-from .repro import write_reproducibility_manifests
 from .pipeline import SelectionConfig
+from .repro import write_reproducibility_manifests
 from .sampling import (
     build_sampling_manifest,
     read_manifests_jsonl,
@@ -254,6 +255,129 @@ def _run_analyze_signals(args: argparse.Namespace) -> int:
     }
     _write_json(summary_path, summary)
     print(f"Wrote {len(metric_rows)} item metric rows and summary to {output_dir}")
+    return 0
+
+
+def _load_boundary_count_spec(
+    count: int | None,
+    counts_json: str | None,
+) -> tuple[int | Mapping[str, int], Path | None]:
+    if count is not None:
+        if count <= 0:
+            raise ValueError("count must be positive")
+        return int(count), None
+    if counts_json is None:
+        raise ValueError("one boundary-count source is required")
+    source = Path(counts_json)
+    with source.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, Mapping):
+        raise ValueError("counts JSON must be an object mapping video IDs to counts")
+    values: dict[str, int] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("counts JSON keys must be non-empty strings")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("counts JSON values must be positive integers")
+        values[key] = int(value)
+    if not values:
+        raise ValueError("counts JSON must not be empty")
+    return values, source
+
+
+def _run_matched_selection(args: argparse.Namespace) -> int:
+    input_path = Path(args.input)
+    output_dir = Path(args.output_dir)
+    loaded_config = load_phase_stable_config(args.config)
+    boundary_counts, counts_path = _load_boundary_count_spec(
+        args.count, args.counts_json
+    )
+    records = read_signal_records(input_path)
+    traces, metric_rows = run_matched_selection_experiment(
+        records,
+        output_dir,
+        boundary_counts,
+        config=loaded_config.experiment,
+        selection_config=loaded_config.selection,
+        method_suffix=args.method_suffix,
+    )
+
+    jsonl_path = _write_jsonl(output_dir / "item_metrics.jsonl", metric_rows)
+    csv_path = _write_csv(output_dir / "item_metrics.csv", metric_rows)
+    aggregate = aggregate_item_metrics(metric_rows)
+    bootstrap = paired_metric_bootstrap(
+        metric_rows,
+        baseline_method=args.baseline_method,
+        treatment_method=args.treatment_method,
+        metric_names=tuple(args.bootstrap_metrics),
+        n_bootstrap=args.n_bootstrap,
+        confidence=args.confidence,
+        seed=args.seed,
+    )
+    count_policy: dict[str, Any]
+    if counts_path is None:
+        count_policy = {"source": "fixed", "count": int(boundary_counts)}
+    else:
+        count_policy = {
+            "source": "counts_json",
+            "path": counts_path,
+            "num_videos": len(boundary_counts),
+        }
+    summary_path = output_dir / "summary.json"
+    feature_inputs = sorted(
+        {
+            Path(record.visual_features_path)
+            for record in records
+            if record.visual_features_path is not None
+        },
+        key=lambda path: str(path.resolve()),
+    )
+    manifest_inputs = [input_path, Path(args.config), *feature_inputs]
+    if counts_path is not None:
+        manifest_inputs.append(counts_path)
+    run_manifest_path, environment_path = write_reproducibility_manifests(
+        output_dir,
+        command="matched-selection",
+        config={
+            "experiment": asdict(loaded_config.experiment),
+            "selection": asdict(loaded_config.selection),
+            "boundary_policy": count_policy,
+            "method_suffix": args.method_suffix,
+        },
+        input_paths=tuple(manifest_inputs),
+        extra={
+            "num_signal_records": len(records),
+            "num_traces": len(traces),
+            "num_item_metrics": len(metric_rows),
+        },
+    )
+    summary = {
+        "command": "matched-selection",
+        "input": input_path,
+        "output_dir": output_dir,
+        "config": loaded_config.experiment,
+        "selection_config": loaded_config.selection,
+        "boundary_policy": count_policy,
+        "method_suffix": args.method_suffix,
+        "num_signal_records": len(records),
+        "num_traces": len(traces),
+        "num_item_metrics": len(metric_rows),
+        "aggregate": aggregate,
+        "bootstrap": bootstrap,
+        "artifacts": {
+            "traces_jsonl": output_dir / "traces.jsonl",
+            "item_metrics_jsonl": jsonl_path,
+            "item_metrics_csv": csv_path,
+            "summary_json": summary_path,
+            "run_manifest_json": run_manifest_path,
+            "environment_json": environment_path,
+        },
+    }
+    _write_json(summary_path, summary)
+    print(
+        f"Wrote {len(metric_rows)} matched-selection metric rows and summary "
+        f"to {output_dir}"
+    )
     return 0
 
 
@@ -605,6 +729,35 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--confidence", type=float, default=0.95)
     analyze.add_argument("--seed", type=int, default=0)
     analyze.set_defaults(handler=_run_analyze_signals)
+
+    matched_selection = subparsers.add_parser(
+        "matched-selection",
+        help="Rerun DWT/TI-DWT selection with the same calibrated top-B count.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    matched_selection.add_argument("input", help="OriginSignalRecord JSONL input.")
+    matched_selection.add_argument(
+        "output_dir", help="Isolated directory for matched traces and metrics."
+    )
+    matched_selection.add_argument("--config", required=True)
+    matched_count_group = matched_selection.add_mutually_exclusive_group(required=True)
+    matched_count_group.add_argument("--count", type=int)
+    matched_count_group.add_argument(
+        "--counts-json",
+        help="Calibration-only JSON mapping video IDs to positive boundary counts.",
+    )
+    matched_selection.add_argument("--method-suffix", default="_matched")
+    matched_selection.add_argument("--baseline-method", default="dwt_matched")
+    matched_selection.add_argument("--treatment-method", default="swt_matched")
+    matched_selection.add_argument(
+        "--bootstrap-metrics",
+        nargs="+",
+        default=DEFAULT_BOOTSTRAP_METRICS,
+    )
+    matched_selection.add_argument("--n-bootstrap", type=int, default=10_000)
+    matched_selection.add_argument("--confidence", type=float, default=0.95)
+    matched_selection.add_argument("--seed", type=int, default=0)
+    matched_selection.set_defaults(handler=_run_matched_selection)
 
     shifts = subparsers.add_parser(
         "controlled-shifts",

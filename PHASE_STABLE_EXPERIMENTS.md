@@ -231,6 +231,34 @@ python -m phase_stable matched-boundaries `
 
 count key는 `video_id` 또는 `dataset/video_id`다. 현재 CLI는 count를 calibration data에서 자동 추정하지 않는다. 출력은 query-method별 `matched_boundary_f1_mean/worst`, mean displacement, matched segment ARI/VI를 담은 JSONL이다.
 
+동일 boundary count가 최종 keyframe 선택과 MLLM에 미치는 영향을 검사하려면
+기존 signal/feature artifact에서 post-transform selection 전체를 다시 실행한다.
+
+```powershell
+python -m phase_stable matched-selection `
+  $Signals (Join-Path $Run "matched_cardinality\b04\analysis") `
+  --config .\configs\phase_stable_icassp.yaml `
+  --count 4 `
+  --n-bootstrap 1000 `
+  --seed 20260810
+```
+
+이 경로는 DWT/SWT 모두 saliency 상위 `B`개를 동일한 deterministic NMS로
+선택해 정확히 `B+1`개 segment를 만든다. 이후 segment importance, filtering,
+K=16 allocation과 MMR은 원 pipeline을 그대로 사용한다. trace method는
+`dwt_matched`, `swt_matched`이며 기존 adaptive 결과와 섞이지 않는다. A100에서
+완료된 Stage-0 이후 export부터 Qwen 평가까지 한 번에 실행하려면 다음을 쓴다.
+
+```bash
+bash scripts/run_a100_experiment.sh \
+  --skip-bootstrap --no-download-data \
+  --matched-only --matched-count 4
+```
+
+산출물은 `artifacts/<run>/matched_cardinality/b04/` 아래에 격리된다. 현재
+20-video 결과에 대한 이 재실험은 원인 진단용이며, 논문 confirmatory test에는
+별도 calibration subset에서 고정한 count만 사용한다.
+
 ### 5.6 Uniform과 Top-K selection baseline
 
 ```powershell

@@ -83,6 +83,23 @@ Uniform/Top-K까지 MLLM grid에 포함한다.
 bash scripts/run_a100_experiment.sh --include-baselines
 ```
 
+완료된 Stage-0를 재사용해 DWT와 SWT 모두 경계 4개로 고정한 반사실적
+keyframe/MLLM 실험만 실행한다. 기존 일반 DWT/SWT 산출물은 수정하지 않고
+`matched_cardinality/b04/` 아래에 새 10개 cell을 만든다.
+
+```bash
+bash scripts/run_a100_experiment.sh \
+  --skip-bootstrap \
+  --no-download-data \
+  --matched-only \
+  --matched-count 4
+```
+
+이 명령은 기존 `origin_signals.jsonl`이 있어야 하며, 재실행하면 완료 marker가
+유효한 matched cell을 건너뛴다. 원래 Stage-0가 기록한 effective config도
+읽기 전용으로 재사용한다. `B=4`는 Stage-0 계획에 미리 적힌 진단값이다.
+논문 test set에서는 별도 calibration data로 count를 정한 뒤 고정해야 한다.
+
 전체 VideoMME로 전환한다. 이 옵션은 모든 원본 영상을 받고 strict export와 10,000회 bootstrap을 사용하므로 충분한 디스크와 실행 시간을 확보해야 한다.
 
 ```bash
@@ -117,6 +134,7 @@ keyframes/*.json                  method × origin keyframe annotation
 mllm/videomme/*/origin*/          cell별 lmms-eval 결과와 console log
 predictions.jsonl                 공식 parser 기반 7-field prediction grid
 mllm_stability_summary.json       accuracy/agreement/robust accuracy와 paired CI
+matched_cardinality/b04/          동일 경계 수 DWT/SWT 반사실적 전체 산출물
 .stage0_state/*.done.json         검증 가능한 Stage-0 resume marker
 ```
 

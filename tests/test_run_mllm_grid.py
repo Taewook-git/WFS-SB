@@ -125,6 +125,34 @@ def test_help_and_dry_run_show_benchmark_mapping_without_writes(tmp_path: Path):
     assert not output.exists()
 
 
+def test_dry_run_accepts_isolated_matched_method_grid(tmp_path: Path):
+    keyframes = tmp_path / "matched" / "keyframes"
+    output = tmp_path / "matched" / "mllm"
+    _keyframes(
+        keyframes,
+        methods=("dwt_matched", "swt_matched"),
+        origins=(0, 1),
+    )
+    result = _run(
+        "--benchmark",
+        "videomme",
+        "--keyframe-dir",
+        _bash_path(keyframes),
+        "--output-root",
+        _bash_path(output),
+        "--methods",
+        "dwt_matched,swt_matched",
+        "--origins",
+        "0,1",
+        "--dry-run",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "methods=dwt_matched swt_matched" in result.stdout
+    assert "videomme_dwt_matched_origin00.json" in result.stdout
+    assert "videomme_swt_matched_origin01.json" in result.stdout
+    assert not output.exists()
+
+
 def test_success_requires_logs_then_marker_and_valid_marker_resumes(tmp_path: Path):
     keyframes = tmp_path / "keyframes"
     output = tmp_path / "output"

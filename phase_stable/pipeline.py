@@ -12,6 +12,88 @@ from wfs.core import WFSBudgetAllocator, WFSEventDetector, WFSFrameSelector
 from .transforms import TemporalTransform, TransformResult
 
 
+def select_top_nms_indices(
+    values: Sequence[float],
+    count: int,
+    min_distance: int,
+    valid_mask: Optional[Sequence[bool]] = None,
+) -> np.ndarray:
+    """Select exactly ``count`` interior samples with deterministic NMS.
+
+    The exact distance-constrained set with maximum total value is returned;
+    earlier time breaks ties.
+    Endpoints are excluded because they cannot represent an interior segment
+    boundary.  The same helper is used by matched-cardinality analysis and by
+    the counterfactual keyframe selector so both stages apply an identical
+    boundary policy.
+    """
+
+    scores = np.asarray(values, dtype=float)
+    if scores.ndim != 1 or scores.size < 3 or not np.all(np.isfinite(scores)):
+        raise ValueError("values must be a finite 1-D array of length >= 3")
+    if isinstance(count, bool) or not isinstance(count, (int, np.integer)):
+        raise TypeError("count must be an integer")
+    if isinstance(min_distance, bool) or not isinstance(
+        min_distance, (int, np.integer)
+    ):
+        raise TypeError("min_distance must be an integer")
+    count = int(count)
+    min_distance = int(min_distance)
+    if count <= 0 or min_distance <= 0:
+        raise ValueError("count and min_distance must be positive")
+
+    candidate_indices = np.arange(1, scores.size - 1)
+    if valid_mask is not None:
+        mask = np.asarray(valid_mask, dtype=bool)
+        if mask.shape != scores.shape:
+            raise ValueError("valid_mask must align with values")
+        candidate_indices = candidate_indices[mask[candidate_indices]]
+
+    # Dynamic programming avoids a greedy-NMS failure mode where selecting the
+    # single highest middle candidate prevents an otherwise feasible exact-B
+    # set.  Each state stores (total saliency, indices); ties prefer the
+    # lexicographically earlier set for deterministic temporal behavior.
+    states: list[list[tuple[float, tuple[int, ...]] | None]] = [
+        [None] * (count + 1) for _ in range(candidate_indices.size + 1)
+    ]
+    states[0][0] = (0.0, ())
+    for row_index, raw_index in enumerate(candidate_indices, start=1):
+        index = int(raw_index)
+        compatible_count = int(
+            np.searchsorted(candidate_indices, index - min_distance, side="right")
+        )
+        states[row_index][0] = (0.0, ())
+        for selected_count in range(1, count + 1):
+            excluded = states[row_index - 1][selected_count]
+            prior = states[compatible_count][selected_count - 1]
+            included = None
+            if prior is not None:
+                included = (
+                    prior[0] + float(scores[index]),
+                    (*prior[1], index),
+                )
+            if excluded is None:
+                states[row_index][selected_count] = included
+            elif included is None:
+                states[row_index][selected_count] = excluded
+            elif included[0] > excluded[0]:
+                states[row_index][selected_count] = included
+            elif included[0] < excluded[0]:
+                states[row_index][selected_count] = excluded
+            else:
+                states[row_index][selected_count] = min(
+                    included, excluded, key=lambda value: value[1]
+                )
+
+    result = states[-1][count]
+    if result is None:
+        raise ValueError(
+            f"cannot select {count} boundaries with min_distance={min_distance} "
+            f"from {scores.size} samples"
+        )
+    return np.asarray(result[1], dtype=int)
+
+
 @dataclass
 class SelectionTrace:
     """All intermediate values needed by the phase-stability experiments."""
@@ -96,6 +178,8 @@ class PhaseStableWFS:
         num_frames: int,
         min_peak_distance: int,
         features: Optional[np.ndarray] = None,
+        *,
+        boundary_count: Optional[int] = None,
     ) -> SelectionTrace:
         """Run transform, segmentation, budget allocation, and frame selection."""
 
@@ -108,15 +192,28 @@ class PhaseStableWFS:
             raise ValueError("num_frames must be positive")
         if min_peak_distance <= 0:
             raise ValueError("min_peak_distance must be positive")
+        if boundary_count is not None and (
+            isinstance(boundary_count, bool)
+            or not isinstance(boundary_count, (int, np.integer))
+            or int(boundary_count) <= 0
+        ):
+            raise ValueError("boundary_count must be a positive integer")
         if features is not None:
             features = np.asarray(features)
             if features.ndim < 2 or features.shape[0] != scores.size:
                 raise ValueError("features must be frame-aligned with relevance_scores")
 
         transform_result = self.transform.transform(scores)
-        peaks = self.event_detector.detect_peaks(
-            transform_result.coarse_detail, min_peak_distance
-        )
+        if boundary_count is None:
+            peaks = self.event_detector.detect_peaks(
+                transform_result.coarse_detail, min_peak_distance
+            )
+        else:
+            peaks = select_top_nms_indices(
+                transform_result.saliency,
+                int(boundary_count),
+                min_peak_distance,
+            )
         segments = self.event_detector.create_segments(peaks, scores.size)
 
         if scores.size <= num_frames:

@@ -52,6 +52,7 @@ def test_parser_and_python_module_help_smoke():
     help_text = parser.format_help()
     for command in (
         "analyze-signals",
+        "matched-selection",
         "controlled-shifts",
         "evaluate-predictions",
         "make-manifests",
@@ -202,3 +203,50 @@ def test_analyze_signals_command_writes_csv_jsonl_and_summary(tmp_path: Path):
     assert set(summary["aggregate"]) == {"dwt", "swt"}
     assert "representation_consistency_mean" in summary["bootstrap"]["metrics"]
     assert summary["bootstrap"]["num_paired_items"] == 1
+
+
+def test_matched_selection_command_writes_isolated_summary(tmp_path: Path):
+    records = []
+    for origin_id, origin_sec in enumerate((0.1, 0.6)):
+        timestamps = origin_sec + np.arange(64, dtype=float)
+        scores = 0.5 + 0.25 * np.sin(timestamps / 5.0)
+        records.append(
+            OriginSignalRecord(
+                dataset="demo",
+                video_id="v1",
+                question_id="q1",
+                origin_id=origin_id,
+                origin_sec=origin_sec,
+                timestamps_sec=tuple(timestamps),
+                actual_pts_sec=tuple(timestamps),
+                source_frame_indices=tuple(range(64)),
+                relevance_scores=tuple(scores),
+            )
+        )
+    source = tmp_path / "signals.jsonl"
+    output_dir = tmp_path / "matched"
+    config = Path(__file__).resolve().parents[1] / "configs" / "phase_stable_icassp.yaml"
+    write_signal_records(source, records)
+    assert main(
+        [
+            "matched-selection",
+            str(source),
+            str(output_dir),
+            "--config",
+            str(config),
+            "--count",
+            "4",
+            "--n-bootstrap",
+            "10",
+        ]
+    ) == 0
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["boundary_policy"] == {"source": "fixed", "count": 4}
+    assert set(summary["aggregate"]) == {"dwt_matched", "swt_matched"}
+    assert summary["bootstrap"]["baseline_method"] == "dwt_matched"
+    traces = [
+        json.loads(line)
+        for line in (output_dir / "traces.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(traces) == 4
+    assert all(len(row["peaks"]) == 4 for row in traces)

@@ -43,21 +43,34 @@ def test_launcher_documents_and_chains_the_complete_default_run() -> None:
     assert "DWT/SWT" in result.stdout
     assert "official" in result.stdout and "parser" in result.stdout
     assert "resume" in result.stdout
+    assert "--matched-only" in result.stdout
+    assert "10 new Qwen cells" in result.stdout
 
     source = LAUNCHER.read_text(encoding="utf-8")
-    ordered_calls = [
-        "bootstrap_a100.sh",
-        "fetch_videomme.sh",
-        "run_stage0.sh",
-        "run_mllm_grid.sh",
-        "evaluate-predictions",
+    positions = [
+        source.index("bootstrap_a100.sh"),
+        source.index("fetch_videomme.sh"),
+        source.index('bash "${SCRIPT_DIR}/run_stage0.sh"'),
+        source.rindex('bash "${SCRIPT_DIR}/run_mllm_grid.sh"'),
+        source.rindex("evaluate-predictions"),
     ]
-    positions = [source.index(value) for value in ordered_calls]
     assert positions == sorted(positions)
     assert 'payload["experiment"]["frame_budget"] = budget' in source
     assert "--qwen-max-pixels N" in result.stdout
     assert "QWEN_MAX_PIXELS=200704" in source
     assert '--max-pixels "$QWEN_MAX_PIXELS"' in source
+    assert "matched-selection" in source
+    assert "--methods dwt_matched,swt_matched" in source
+    assert '${RUN_DIR}/matched_cardinality/${matched_token}' in source
+    assert "--baseline-method dwt_matched" in source
+    assert "--treatment-method swt_matched" in source
+    assert "if ((MATCHED_ONLY)); then" in source
+    assert ".stage0_state/preprocess.done.json" in source
+    assert "origin signal/features no longer match" in source
+    assert "annotation subset differs" in source
+    assert "cannot rewrite the completed Stage-0 config" in source
+    assert "CONFIG_EXPLICIT=1" in source
+    assert "completed Stage-0 analysis config is missing" in source
     assert "HF_TOKEN" not in source or "printf 'HF_TOKEN" not in source
 
 

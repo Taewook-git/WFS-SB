@@ -32,7 +32,7 @@ from .metrics import (
     tolerant_boundary_metrics,
     video_cluster_paired_bootstrap,
 )
-from .pipeline import PhaseStableWFS, SelectionConfig
+from .pipeline import PhaseStableWFS, SelectionConfig, select_top_nms_indices
 from .transforms import TransformConfig, build_transform
 
 
@@ -244,6 +244,113 @@ def run_real_origin_experiment(
                     features=_load_features(record),
                 )
                 _, row = save_trace_npz(output_root, record, method, trace)
+                row["level"] = level
+                row["min_peak_distance"] = min_distance
+                trace_rows.append(row)
+
+    trace_path = output_root / "traces.jsonl"
+    write_jsonl(trace_path, trace_rows)
+    metric_rows = compute_trace_metrics(trace_rows, config=experiment)
+    write_jsonl(output_root / "item_metrics.jsonl", metric_rows)
+    return trace_rows, metric_rows
+
+
+def _resolve_matched_boundary_count(
+    boundary_counts: int | Mapping[str, int],
+    dataset: str,
+    video_id: str,
+) -> tuple[int, str]:
+    if not isinstance(boundary_counts, Mapping):
+        raw_count: Any = boundary_counts
+        source = "fixed"
+    else:
+        compound = f"{dataset}/{video_id}"
+        if compound in boundary_counts:
+            raw_count = boundary_counts[compound]
+        elif video_id in boundary_counts:
+            raw_count = boundary_counts[video_id]
+        else:
+            raise ValueError(f"no calibrated boundary count for {compound}")
+        source = "counts_json"
+    if isinstance(raw_count, bool) or not isinstance(raw_count, (int, np.integer)):
+        raise TypeError("calibrated boundary counts must be integers")
+    count = int(raw_count)
+    if count <= 0:
+        raise ValueError("calibrated boundary counts must be positive")
+    return count, source
+
+
+def run_matched_selection_experiment(
+    records: Sequence[OriginSignalRecord],
+    output_dir: str | Path,
+    boundary_counts: int | Mapping[str, int],
+    *,
+    config: Optional[ExperimentConfig] = None,
+    selection_config: Optional[SelectionConfig] = None,
+    method_suffix: str = "_matched",
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    """Rerun selection with an identical fixed top-B policy for every method.
+
+    ``boundary_counts`` must be fixed globally or supplied by a calibration-only
+    video mapping.  Counts never depend on method or sampling origin.  Temporal
+    transforms remain method-specific; every downstream WFS-SB stage is shared.
+    """
+
+    experiment = config or ExperimentConfig()
+    if not method_suffix or any(
+        not (character.isalnum() or character in "_.-")
+        for character in method_suffix
+    ):
+        raise ValueError("method_suffix must use only letters, numbers, '_', '.', or '-'")
+    groups = group_signal_records(records)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    trace_rows: list[Dict[str, Any]] = []
+
+    for item_key in sorted(groups):
+        group = groups[item_key]
+        dataset, video_id, _ = item_key
+        boundary_count, count_source = _resolve_matched_boundary_count(
+            boundary_counts, dataset, video_id
+        )
+        signal_length = len(group[0].relevance_scores)
+        level = experiment.level
+        if level is None:
+            level = compute_dwt_level(
+                signal_length,
+                wavelet=experiment.wavelet,
+                drift=experiment.drift_level,
+            )
+        min_distance = compute_min_peak_distance(
+            signal_length,
+            ratio=experiment.min_distance_ratio,
+            absolute_min=experiment.min_distance_absolute,
+        )
+        for base_method in experiment.methods:
+            method = f"{base_method}{method_suffix}"
+            transform_config = _method_transform_config(base_method, level, experiment)
+            pipeline = PhaseStableWFS(
+                build_transform(transform_config),
+                selection_config,
+            )
+            for record in group:
+                trace = pipeline.run(
+                    record.relevance_scores,
+                    experiment.frame_budget,
+                    min_distance,
+                    features=_load_features(record),
+                    boundary_count=boundary_count,
+                )
+                _, row = save_trace_npz(output_root, record, method, trace)
+                row["base_method"] = base_method
+                row["boundary_policy"] = {
+                    "type": "fixed_top_b_nms",
+                    "count": boundary_count,
+                    "count_source": count_source,
+                    "ranking_signal": "abs_coarse_detail",
+                    "min_peak_distance": min_distance,
+                }
+                row["matched_boundary_count"] = boundary_count
                 row["level"] = level
                 row["min_peak_distance"] = min_distance
                 trace_rows.append(row)
@@ -680,40 +787,6 @@ def aggregate_item_metrics(
     return result
 
 
-def _top_nms_indices(
-    saliency: np.ndarray,
-    count: int,
-    min_distance: int,
-    valid_mask: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    values = np.asarray(saliency, dtype=float)
-    if values.ndim != 1 or values.size < 3 or not np.all(np.isfinite(values)):
-        raise ValueError("saliency must be a finite 1-D array of length >=3")
-    if count <= 0 or min_distance <= 0:
-        raise ValueError("count and min_distance must be positive")
-    # Boundaries exclude endpoints. Ranking is stable: earlier time wins ties.
-    candidate_indices = np.arange(1, values.size - 1)
-    if valid_mask is not None:
-        mask = np.asarray(valid_mask, dtype=bool)
-        if mask.shape != values.shape:
-            raise ValueError("valid_mask must align with saliency")
-        candidate_indices = candidate_indices[mask[candidate_indices]]
-    candidates = candidate_indices[
-        np.lexsort((candidate_indices, -values[candidate_indices]))
-    ]
-    selected: list[int] = []
-    for candidate in candidates:
-        index = int(candidate)
-        if all(abs(index - prior) >= min_distance for prior in selected):
-            selected.append(index)
-            if len(selected) == count:
-                return np.asarray(sorted(selected), dtype=int)
-    raise ValueError(
-        f"cannot select {count} boundaries with min_distance={min_distance} "
-        f"from {values.size} samples"
-    )
-
-
 def compute_matched_cardinality_metrics(
     trace_rows: Sequence[Mapping[str, Any]],
     boundary_counts: int | Mapping[str, int],
@@ -739,31 +812,14 @@ def compute_matched_cardinality_metrics(
         )
         groups[key].append(row)
 
-    def resolve_count(key: tuple[str, str, str, str]) -> int:
-        if isinstance(boundary_counts, (int, np.integer)) and not isinstance(
-            boundary_counts, bool
-        ):
-            count = int(boundary_counts)
-        elif isinstance(boundary_counts, Mapping):
-            compound = f"{key[0]}/{key[1]}"
-            if compound in boundary_counts:
-                count = int(boundary_counts[compound])
-            elif key[1] in boundary_counts:
-                count = int(boundary_counts[key[1]])
-            else:
-                raise ValueError(f"no calibrated boundary count for {compound}")
-        else:
-            raise TypeError("boundary_counts must be an integer or mapping")
-        if count <= 0:
-            raise ValueError("calibrated boundary counts must be positive")
-        return count
-
     results: list[Dict[str, Any]] = []
     for key in sorted(groups):
         rows = sorted(groups[key], key=lambda row: int(row["origin_id"]))
         if len(rows) < 2:
             raise ValueError(f"trace group {key} must contain at least two origins")
-        count = resolve_count(key)
+        count, _ = _resolve_matched_boundary_count(
+            boundary_counts, key[0], key[1]
+        )
         boundaries: list[np.ndarray] = []
         timestamps: list[Sequence[float]] = []
         arrays = [load_trace_arrays(row) for row in rows]
@@ -775,7 +831,7 @@ def compute_matched_cardinality_metrics(
         )
         for row, array in zip(rows, arrays):
             times = np.asarray(row["timestamps_sec"], dtype=float)
-            indices = _top_nms_indices(
+            indices = select_top_nms_indices(
                 array["saliency"],
                 count,
                 int(row["min_peak_distance"]),
@@ -1076,4 +1132,5 @@ __all__ = [
     "group_signal_records",
     "paired_metric_bootstrap",
     "run_real_origin_experiment",
+    "run_matched_selection_experiment",
 ]
