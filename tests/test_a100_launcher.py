@@ -161,7 +161,8 @@ def test_matched_launcher_checks_provenance_then_runs_joint_interaction() -> Non
     assert "--matched-baseline-method dwt_matched" in source
     assert "--matched-treatment-method swt_matched" in source
     interaction_block = source[interaction : source.index("printf '\\nMatched", interaction)]
-    assert '--n-bootstrap "$bootstrap_repetitions"' in interaction_block
+    assert 'interaction_bootstrap_repetitions=50000' in source
+    assert '--n-bootstrap "$interaction_bootstrap_repetitions"' in interaction_block
     assert '--seed "$SEED"' in interaction_block
 
 

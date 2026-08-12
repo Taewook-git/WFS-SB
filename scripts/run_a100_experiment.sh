@@ -318,6 +318,10 @@ for ((origin = 0; origin < NUM_ORIGINS; origin++)); do
 done
 bootstrap_repetitions=1000
 ((FULL_RUN == 0)) || bootstrap_repetitions=10000
+# The interaction bootstrap is CPU-only and its tail endpoint determines the
+# primary downstream conclusion, so keep Monte Carlo error small even in the
+# 20-video pilot.
+interaction_bootstrap_repetitions=50000
 
 run_matched_counterfactual() {
   local origin
@@ -705,7 +709,7 @@ PY
     --adaptive-treatment-method swt \
     --matched-baseline-method dwt_matched \
     --matched-treatment-method swt_matched \
-    --n-bootstrap "$bootstrap_repetitions" \
+    --n-bootstrap "$interaction_bootstrap_repetitions" \
     --confidence 0.95 \
     --seed "$SEED"
 
