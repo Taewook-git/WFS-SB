@@ -1014,16 +1014,26 @@ def controlled_shift_metrics(
     return results
 
 
-def evaluate_prediction_rows(
+PredictionItemKey = tuple[str, str, str]
+PredictionMatrix = tuple[
+    list[PredictionItemKey], tuple[int, ...], np.ndarray, np.ndarray
+]
+
+_DOWNSTREAM_EFFECT_METRICS = (
+    "mean_accuracy",
+    "robust_accuracy",
+    "pairwise_answer_disagreement",
+)
+_INTERACTION_EFFECT_METRICS = (
+    *_DOWNSTREAM_EFFECT_METRICS,
+    "worst_origin_accuracy",
+)
+
+
+def _build_prediction_matrices(
     rows: Sequence[Mapping[str, Any]],
-    *,
-    baseline_method: str = "dwt",
-    treatment_method: str = "swt",
-    n_bootstrap: int = 10_000,
-    confidence: float = 0.95,
-    seed: int = 0,
-) -> Dict[str, Any]:
-    """Aggregate MLLM prediction JSONL and compute paired video-cluster CIs."""
+) -> Dict[str, PredictionMatrix]:
+    """Validate prediction rows and construct deterministic method matrices."""
 
     grouped: Dict[str, Dict[tuple[str, str, str], Dict[int, Mapping[str, Any]]]] = defaultdict(
         lambda: defaultdict(dict)
@@ -1035,16 +1045,21 @@ def evaluate_prediction_rows(
             raise ValueError(f"prediction row missing fields: {', '.join(missing)}")
         method = str(row["method"])
         item = (str(row["dataset"]), str(row["video_id"]), str(row["question_id"]))
-        origin_id = int(row["origin_id"])
+        raw_origin_id = row["origin_id"]
+        if (
+            isinstance(raw_origin_id, bool)
+            or not isinstance(raw_origin_id, (int, np.integer))
+            or int(raw_origin_id) < 0
+        ):
+            raise ValueError(
+                f"origin_id must be a non-negative integer for {method}/{item}"
+            )
+        origin_id = int(raw_origin_id)
         if origin_id in grouped[method][item]:
             raise ValueError(f"duplicate prediction for {method}/{item}/origin={origin_id}")
         grouped[method][item][origin_id] = row
 
-    method_metrics: Dict[str, Any] = {}
-    matrices: Dict[
-        str,
-        tuple[list[tuple[str, str, str]], tuple[int, ...], np.ndarray, np.ndarray],
-    ] = {}
+    matrices: Dict[str, PredictionMatrix] = {}
     for method, items in sorted(grouped.items()):
         item_keys = sorted(items)
         origin_sets = [tuple(sorted(items[key])) for key in item_keys]
@@ -1054,17 +1069,38 @@ def evaluate_prediction_rows(
             [
                 [items[key][origin]["prediction"] for origin in origin_sets[0]]
                 for key in item_keys
-            ]
+            ],
+            dtype=object,
         )
-        gold = np.asarray([items[key][origin_sets[0][0]]["gold"] for key in item_keys])
+        gold = np.asarray(
+            [items[key][origin_sets[0][0]]["gold"] for key in item_keys],
+            dtype=object,
+        )
         for key in item_keys:
             if any(items[key][origin]["gold"] != items[key][origin_sets[0][0]]["gold"] for origin in origin_sets[0]):
                 raise ValueError(f"gold answer changes across origins for {method}/{key}")
-        method_metrics[method] = mllm_stability_metrics(predictions, gold)
         matrices[method] = (item_keys, origin_sets[0], predictions, gold)
+    return matrices
+
+
+def _aligned_prediction_pair(
+    matrices: Mapping[str, PredictionMatrix],
+    baseline_method: str,
+    treatment_method: str,
+    *,
+    context: str | None = None,
+) -> tuple[
+    list[PredictionItemKey], tuple[int, ...], np.ndarray, np.ndarray, np.ndarray
+]:
+    """Return a strictly aligned baseline/treatment prediction pair."""
 
     if baseline_method not in matrices or treatment_method not in matrices:
-        raise ValueError("both baseline_method and treatment_method are required")
+        if context is None:
+            raise ValueError("both baseline_method and treatment_method are required")
+        raise ValueError(
+            f"{context} predictions require methods "
+            f"{baseline_method!r} and {treatment_method!r}"
+        )
     baseline_keys, baseline_origins, baseline_predictions, baseline_gold = matrices[
         baseline_method
     ]
@@ -1077,28 +1113,68 @@ def evaluate_prediction_rows(
         raise ValueError("baseline and treatment origin grids do not align")
     if not np.array_equal(baseline_gold, treatment_gold):
         raise ValueError("baseline and treatment gold answers do not align")
+    return (
+        baseline_keys,
+        baseline_origins,
+        baseline_predictions,
+        treatment_predictions,
+        baseline_gold,
+    )
+
+
+def _prediction_effect(
+    baseline_predictions: np.ndarray,
+    treatment_predictions: np.ndarray,
+    gold: np.ndarray,
+    metric_names: Sequence[str],
+) -> np.ndarray:
+    baseline = mllm_stability_metrics(baseline_predictions, gold)
+    treatment = mllm_stability_metrics(treatment_predictions, gold)
+    return np.asarray(
+        [treatment[name] - baseline[name] for name in metric_names], dtype=float
+    )
+
+
+def evaluate_prediction_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    baseline_method: str = "dwt",
+    treatment_method: str = "swt",
+    n_bootstrap: int = 10_000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Aggregate MLLM prediction JSONL and compute paired video-cluster CIs."""
+
+    matrices = _build_prediction_matrices(rows)
+    method_metrics = {
+        method: mllm_stability_metrics(matrix[2], matrix[3])
+        for method, matrix in matrices.items()
+    }
+    (
+        baseline_keys,
+        _,
+        baseline_predictions,
+        treatment_predictions,
+        baseline_gold,
+    ) = _aligned_prediction_pair(matrices, baseline_method, treatment_method)
 
     def downstream_effect(baseline_sample: np.ndarray, treatment_sample: np.ndarray) -> np.ndarray:
         # Gold values are encoded in an extra final column to keep cluster
         # bootstrap rows self-contained.
         base_pred, gold_values = baseline_sample[:, :-1], baseline_sample[:, -1]
         treatment_pred = treatment_sample[:, :-1]
-        base = mllm_stability_metrics(base_pred, gold_values)
-        treatment = mllm_stability_metrics(treatment_pred, gold_values)
-        return np.asarray(
-            [
-                treatment["mean_accuracy"] - base["mean_accuracy"],
-                treatment["robust_accuracy"] - base["robust_accuracy"],
-                treatment["pairwise_answer_disagreement"]
-                - base["pairwise_answer_disagreement"],
-            ],
-            dtype=float,
+        return _prediction_effect(
+            base_pred,
+            treatment_pred,
+            gold_values,
+            _DOWNSTREAM_EFFECT_METRICS,
         )
 
     # Object arrays allow arbitrary multiple-choice labels while preserving
     # the row-wise cluster resampling contract.
     baseline_bootstrap = np.column_stack([baseline_predictions, baseline_gold])
-    treatment_bootstrap = np.column_stack([treatment_predictions, treatment_gold])
+    treatment_bootstrap = np.column_stack([treatment_predictions, baseline_gold])
     comparison = video_cluster_paired_bootstrap(
         [f"{key[0]}\x1f{key[1]}" for key in baseline_keys],
         baseline_bootstrap,
@@ -1109,15 +1185,207 @@ def evaluate_prediction_rows(
         seed=seed,
     )
     comparison["effect_order"] = [
-        "delta_mean_accuracy",
-        "delta_robust_accuracy",
-        "delta_pairwise_answer_disagreement",
+        f"delta_{name}" for name in _DOWNSTREAM_EFFECT_METRICS
     ]
     return {
         "methods": method_metrics,
         "comparison": comparison,
         "baseline_method": baseline_method,
         "treatment_method": treatment_method,
+    }
+
+
+def evaluate_prediction_interaction_rows(
+    adaptive_rows: Sequence[Mapping[str, Any]],
+    matched_rows: Sequence[Mapping[str, Any]],
+    *,
+    adaptive_baseline_method: str = "dwt",
+    adaptive_treatment_method: str = "swt",
+    matched_baseline_method: str = "dwt_matched",
+    matched_treatment_method: str = "swt_matched",
+    n_bootstrap: int = 10_000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Bootstrap the change in the SWT-minus-DWT effect after matching.
+
+    Every bootstrap draw resamples the same videos across all four arms.  The
+    four method matrices must contain identical items, origins, and gold labels;
+    no implicit intersection or partial-grid comparison is permitted.
+    """
+
+    if adaptive_baseline_method == adaptive_treatment_method:
+        raise ValueError("adaptive baseline and treatment methods must differ")
+    if matched_baseline_method == matched_treatment_method:
+        raise ValueError("matched baseline and treatment methods must differ")
+
+    adaptive_matrices = _build_prediction_matrices(adaptive_rows)
+    matched_matrices = _build_prediction_matrices(matched_rows)
+    (
+        adaptive_keys,
+        adaptive_origins,
+        adaptive_baseline,
+        adaptive_treatment,
+        adaptive_gold,
+    ) = _aligned_prediction_pair(
+        adaptive_matrices,
+        adaptive_baseline_method,
+        adaptive_treatment_method,
+        context="adaptive",
+    )
+    (
+        matched_keys,
+        matched_origins,
+        matched_baseline,
+        matched_treatment,
+        matched_gold,
+    ) = _aligned_prediction_pair(
+        matched_matrices,
+        matched_baseline_method,
+        matched_treatment_method,
+        context="matched",
+    )
+    if adaptive_keys != matched_keys:
+        raise ValueError("adaptive and matched prediction items do not align")
+    if adaptive_origins != matched_origins:
+        raise ValueError("adaptive and matched origin grids do not align")
+    if not np.array_equal(adaptive_gold, matched_gold):
+        raise ValueError("adaptive and matched gold answers do not align")
+
+    origin_count = len(adaptive_origins)
+    adaptive_bundle = np.column_stack(
+        [adaptive_baseline, adaptive_treatment, adaptive_gold]
+    )
+    matched_bundle = np.column_stack(
+        [matched_baseline, matched_treatment, matched_gold]
+    )
+
+    def unpack_regime(
+        sample: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return (
+            sample[:, :origin_count],
+            sample[:, origin_count : 2 * origin_count],
+            sample[:, -1],
+        )
+
+    def joint_effect(
+        adaptive_sample: np.ndarray, matched_sample: np.ndarray
+    ) -> np.ndarray:
+        adaptive_effect = _prediction_effect(
+            *unpack_regime(adaptive_sample),
+            _INTERACTION_EFFECT_METRICS,
+        )
+        matched_effect = _prediction_effect(
+            *unpack_regime(matched_sample),
+            _INTERACTION_EFFECT_METRICS,
+        )
+        return np.concatenate(
+            [adaptive_effect, matched_effect, matched_effect - adaptive_effect]
+        )
+
+    joint = video_cluster_paired_bootstrap(
+        [f"{key[0]}\x1f{key[1]}" for key in adaptive_keys],
+        adaptive_bundle,
+        matched_bundle,
+        statistic=joint_effect,
+        n_bootstrap=n_bootstrap,
+        confidence=confidence,
+        seed=seed,
+    )
+
+    metric_count = len(_INTERACTION_EFFECT_METRICS)
+
+    def comparison_slice(start: int, *, interaction: bool = False) -> Dict[str, Any]:
+        stop = start + metric_count
+        prefix = "interaction_delta_" if interaction else "delta_"
+        return {
+            "estimate": np.asarray(joint["estimate"])[start:stop],
+            "ci_low": np.asarray(joint["ci_low"])[start:stop],
+            "ci_high": np.asarray(joint["ci_high"])[start:stop],
+            "confidence": joint["confidence"],
+            "n_bootstrap": joint["n_bootstrap"],
+            "n_clusters": joint["n_clusters"],
+            "effect_order": [
+                f"{prefix}{name}" for name in _INTERACTION_EFFECT_METRICS
+            ],
+        }
+
+    adaptive_metrics = {
+        adaptive_baseline_method: mllm_stability_metrics(
+            adaptive_baseline, adaptive_gold
+        ),
+        adaptive_treatment_method: mllm_stability_metrics(
+            adaptive_treatment, adaptive_gold
+        ),
+    }
+    matched_metrics = {
+        matched_baseline_method: mllm_stability_metrics(
+            matched_baseline, matched_gold
+        ),
+        matched_treatment_method: mllm_stability_metrics(
+            matched_treatment, matched_gold
+        ),
+    }
+    interaction = comparison_slice(2 * metric_count, interaction=True)
+    interaction["definition"] = (
+        "(matched_treatment - matched_baseline) - "
+        "(adaptive_treatment - adaptive_baseline)"
+    )
+
+    cluster_indices: Dict[tuple[str, str], list[int]] = defaultdict(list)
+    for item_index, key in enumerate(adaptive_keys):
+        cluster_indices[(key[0], key[1])].append(item_index)
+    loo_rows: list[Dict[str, Any]] = []
+    if len(cluster_indices) > 1:
+        all_indices = np.arange(len(adaptive_keys), dtype=int)
+        for (dataset, video_id), excluded in sorted(cluster_indices.items()):
+            keep = np.setdiff1d(
+                all_indices, np.asarray(excluded, dtype=int), assume_unique=True
+            )
+            estimate = joint_effect(
+                adaptive_bundle[keep], matched_bundle[keep]
+            )[-metric_count:]
+            loo_rows.append(
+                {
+                    "dataset": dataset,
+                    "video_id": video_id,
+                    "num_items_excluded": len(excluded),
+                    "estimate": estimate,
+                }
+            )
+    if loo_rows:
+        loo_estimates = np.stack([row["estimate"] for row in loo_rows])
+        loo_min: np.ndarray | None = np.min(loo_estimates, axis=0)
+        loo_max: np.ndarray | None = np.max(loo_estimates, axis=0)
+    else:
+        loo_min = None
+        loo_max = None
+    interaction["leave_one_video_out"] = {
+        "cluster_unit": "dataset/video_id",
+        "num_clusters": len(cluster_indices),
+        "effect_order": interaction["effect_order"],
+        "rows": loo_rows,
+        "min": loo_min,
+        "max": loo_max,
+    }
+    return {
+        "num_paired_items": len(adaptive_keys),
+        "origin_ids": list(adaptive_origins),
+        "cluster_unit": "dataset/video_id",
+        "adaptive": {
+            "baseline_method": adaptive_baseline_method,
+            "treatment_method": adaptive_treatment_method,
+            "methods": adaptive_metrics,
+            "comparison": comparison_slice(0),
+        },
+        "matched": {
+            "baseline_method": matched_baseline_method,
+            "treatment_method": matched_treatment_method,
+            "methods": matched_metrics,
+            "comparison": comparison_slice(metric_count),
+        },
+        "interaction": interaction,
     }
 
 
@@ -1128,6 +1396,7 @@ __all__ = [
     "compute_trace_metrics",
     "compute_matched_cardinality_metrics",
     "controlled_shift_metrics",
+    "evaluate_prediction_interaction_rows",
     "evaluate_prediction_rows",
     "group_signal_records",
     "paired_metric_bootstrap",

@@ -10,6 +10,7 @@ import pytest
 
 from phase_stable.artifacts import OriginSignalRecord, write_signal_records
 from phase_stable.cli import build_parser, main, to_jsonable
+from phase_stable.repro import sha256_file
 from phase_stable.sampling import read_manifests_jsonl
 
 
@@ -54,6 +55,7 @@ def test_parser_and_python_module_help_smoke():
         "analyze-signals",
         "matched-selection",
         "controlled-shifts",
+        "evaluate-prediction-interaction",
         "evaluate-predictions",
         "make-manifests",
     ):
@@ -158,6 +160,82 @@ def test_evaluate_predictions_command(tmp_path: Path):
     assert payload["methods"]["swt"]["robust_accuracy"] == 1.0
     assert payload["comparison"]["effect_order"][1] == "delta_robust_accuracy"
     assert isinstance(payload["comparison"]["estimate"], list)
+
+
+def test_evaluate_prediction_interaction_command(tmp_path: Path):
+    items = (("v0", "q0"), ("v0", "q1"), ("v1", "q0"), ("v1", "q1"))
+    base = (("A", "A"), ("A", "A"), ("A", "B"), ("B", "B"))
+    regimes = (
+        (
+            "adaptive",
+            {
+                "dwt": base,
+                "swt": base,
+            },
+        ),
+        (
+            "matched",
+            {
+                "dwt_matched": base,
+                "swt_matched": (
+                    ("A", "A"),
+                    ("A", "A"),
+                    ("A", "A"),
+                    ("B", "B"),
+                ),
+            },
+        ),
+    )
+    paths = {}
+    row_counts = {}
+    for regime, values in regimes:
+        rows = []
+        for method, predictions in values.items():
+            for (video_id, question_id), item_predictions in zip(items, predictions):
+                for origin_id, prediction in enumerate(item_predictions):
+                    rows.append(
+                        {
+                            "dataset": "demo",
+                            "video_id": video_id,
+                            "question_id": question_id,
+                            "origin_id": origin_id,
+                            "method": method,
+                            "prediction": prediction,
+                            "gold": "A",
+                        }
+                    )
+        path = tmp_path / f"{regime}.jsonl"
+        _write_jsonl(path, list(reversed(rows)))
+        paths[regime] = path
+        row_counts[regime] = len(rows)
+
+    destination = tmp_path / "interaction_summary.json"
+    assert main(
+        [
+            "evaluate-prediction-interaction",
+            str(paths["adaptive"]),
+            str(paths["matched"]),
+            str(destination),
+            "--n-bootstrap",
+            "20",
+            "--seed",
+            "19",
+        ]
+    ) == 0
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    assert payload["command"] == "evaluate-prediction-interaction"
+    assert payload["adaptive_input_sha256"] == sha256_file(paths["adaptive"])
+    assert payload["matched_input_sha256"] == sha256_file(paths["matched"])
+    assert payload["num_adaptive_prediction_rows"] == row_counts["adaptive"]
+    assert payload["num_matched_prediction_rows"] == row_counts["matched"]
+    assert payload["num_paired_items"] == 4
+    assert payload["origin_ids"] == [0, 1]
+    assert payload["cluster_unit"] == "dataset/video_id"
+    assert payload["interaction"]["estimate"] == pytest.approx(
+        [0.125, 0.25, -0.25, 0.25]
+    )
+    assert len(payload["interaction"]["leave_one_video_out"]["rows"]) == 2
+    assert payload["interaction"]["n_clusters"] == 2
 
 
 def test_analyze_signals_command_writes_csv_jsonl_and_summary(tmp_path: Path):

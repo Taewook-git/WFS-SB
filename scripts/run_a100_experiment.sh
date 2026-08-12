@@ -333,6 +333,8 @@ run_matched_counterfactual() {
   local matched_mllm="${matched_root}/mllm"
   local matched_predictions="${matched_root}/predictions.jsonl"
   local matched_summary="${matched_root}/mllm_stability_summary.json"
+  local adaptive_predictions="${RUN_DIR}/predictions.jsonl"
+  local interaction_summary="${matched_root}/adaptive_matched_interaction_summary.json"
 
   [[ -s "$signals_path" ]] || \
     die "completed Stage-0 signals not found for --matched-only: $signals_path"
@@ -558,11 +560,161 @@ PY
     --confidence 0.95 \
     --seed "$SEED"
 
+  [[ -s "$adaptive_predictions" ]] || \
+    die "original adaptive predictions are missing or empty: $adaptive_predictions"
+
+  # MLLM_PROVENANCE_CHECK_BEGIN
+  "$PYTHON_BIN" - \
+    "${RUN_DIR}/mllm/${BENCHMARK}" "${matched_mllm}/${BENCHMARK}" \
+    "$BENCHMARK" "$NUM_ORIGINS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+adaptive_root, matched_root, benchmark, raw_num_origins = sys.argv[1:]
+num_origins = int(raw_num_origins)
+signature_fields = (
+    "config",
+    "task_hashes",
+    "versions",
+    "model_name",
+    "model_source",
+    "chat_template_sha",
+    "system_instruction_sha",
+)
+regimes = (
+    ("adaptive", Path(adaptive_root), ("dwt", "swt")),
+    ("matched", Path(matched_root), ("dwt_matched", "swt_matched")),
+)
+
+
+def read_marker(path: Path) -> dict[str, str]:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise SystemExit(f"missing or empty MLLM completion marker: {path}")
+    fields: dict[str, str] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line or "=" not in line:
+            raise SystemExit(f"malformed MLLM marker {path}:{line_number}")
+        key, value = line.split("=", 1)
+        if key in fields:
+            raise SystemExit(f"duplicate MLLM marker field {key!r} in {path}")
+        fields[key] = value
+    return fields
+
+
+def load_signature(
+    marker_path: Path,
+    *,
+    method: str,
+    origin: int,
+) -> tuple[dict[str, object], Path]:
+    marker = read_marker(marker_path)
+    expected_marker_fields = {
+        "benchmark": benchmark,
+        "method": method,
+        "origin_id": str(origin),
+    }
+    for field, expected in expected_marker_fields.items():
+        if marker.get(field) != expected:
+            raise SystemExit(
+                f"MLLM marker {marker_path} has {field}={marker.get(field)!r}; "
+                f"expected {expected!r}"
+            )
+    raw_result_path = marker.get("results_json")
+    if not raw_result_path:
+        raise SystemExit(f"MLLM marker has no results_json field: {marker_path}")
+    result_path = Path(raw_result_path)
+    if not result_path.is_absolute():
+        result_path = marker_path.parent / result_path
+    if not result_path.is_file() or result_path.stat().st_size <= 0:
+        raise SystemExit(f"MLLM result JSON is missing or empty: {result_path}")
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid MLLM result JSON {result_path}: {exc.msg}") from exc
+    if not isinstance(result, dict):
+        raise SystemExit(f"MLLM result JSON must contain an object: {result_path}")
+    missing = [field for field in signature_fields if field not in result]
+    if missing:
+        raise SystemExit(
+            f"MLLM result JSON {result_path} lacks provenance fields: "
+            f"{', '.join(missing)}"
+        )
+    signature = {field: result[field] for field in signature_fields}
+    return signature, result_path
+
+
+regime_signatures: dict[str, dict[str, object]] = {}
+cell_counts: dict[str, int] = {}
+for regime_name, root, methods in regimes:
+    reference_signature = None
+    reference_result = None
+    count = 0
+    for method in methods:
+        for origin in range(num_origins):
+            marker_path = root / method / f"origin{origin:02d}" / ".complete"
+            signature, result_path = load_signature(
+                marker_path,
+                method=method,
+                origin=origin,
+            )
+            count += 1
+            if reference_signature is None:
+                reference_signature = signature
+                reference_result = result_path
+                continue
+            if signature != reference_signature:
+                changed = [
+                    field
+                    for field in signature_fields
+                    if signature[field] != reference_signature[field]
+                ]
+                raise SystemExit(
+                    f"{regime_name} MLLM provenance differs across cells: "
+                    f"{reference_result} versus {result_path}; changed fields: "
+                    f"{', '.join(changed)}"
+                )
+    if reference_signature is None:
+        raise SystemExit(f"{regime_name} MLLM grid contains no expected cells")
+    regime_signatures[regime_name] = reference_signature
+    cell_counts[regime_name] = count
+
+adaptive_signature = regime_signatures["adaptive"]
+matched_signature = regime_signatures["matched"]
+if adaptive_signature != matched_signature:
+    changed = [
+        field
+        for field in signature_fields
+        if adaptive_signature[field] != matched_signature[field]
+    ]
+    raise SystemExit(
+        "adaptive and matched MLLM provenance do not match; changed fields: "
+        + ", ".join(changed)
+    )
+print(
+    "MLLM provenance preflight: "
+    f"{cell_counts['adaptive']} adaptive and {cell_counts['matched']} matched "
+    "cells share one signature"
+)
+PY
+  # MLLM_PROVENANCE_CHECK_END
+
+  "$PYTHON_BIN" -m phase_stable evaluate-prediction-interaction \
+    "$adaptive_predictions" "$matched_predictions" "$interaction_summary" \
+    --adaptive-baseline-method dwt \
+    --adaptive-treatment-method swt \
+    --matched-baseline-method dwt_matched \
+    --matched-treatment-method swt_matched \
+    --n-bootstrap "$bootstrap_repetitions" \
+    --confidence 0.95 \
+    --seed "$SEED"
+
   printf '\nMatched-cardinality experiment complete.\n'
   printf '  Boundary count:       %s\n' "$MATCHED_COUNT"
   printf '  Matched artifacts:    %s\n' "$matched_root"
   printf '  Matched predictions:  %s\n' "$matched_predictions"
   printf '  Matched MLLM summary: %s\n' "$matched_summary"
+  printf '  Interaction summary:  %s\n' "$interaction_summary"
 }
 
 if ((MATCHED_ONLY)); then

@@ -19,6 +19,7 @@ from .analysis import (
     aggregate_item_metrics,
     compute_matched_cardinality_metrics,
     controlled_shift_metrics,
+    evaluate_prediction_interaction_rows,
     evaluate_prediction_rows,
     paired_metric_bootstrap,
     run_matched_selection_experiment,
@@ -34,7 +35,7 @@ from .benchmarks import (
 from .config import load_phase_stable_config
 from .export import export_trace_jsonl
 from .pipeline import SelectionConfig
-from .repro import write_reproducibility_manifests
+from .repro import sha256_file, write_reproducibility_manifests
 from .sampling import (
     build_sampling_manifest,
     read_manifests_jsonl,
@@ -438,6 +439,43 @@ def _run_evaluate_predictions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_evaluate_prediction_interaction(args: argparse.Namespace) -> int:
+    adaptive_path = Path(args.adaptive_input)
+    matched_path = Path(args.matched_input)
+    adaptive_rows = list(iter_jsonl(adaptive_path))
+    matched_rows = list(iter_jsonl(matched_path))
+    if not adaptive_rows:
+        raise ValueError("adaptive prediction JSONL must contain at least one row")
+    if not matched_rows:
+        raise ValueError("matched prediction JSONL must contain at least one row")
+    evaluation = evaluate_prediction_interaction_rows(
+        adaptive_rows,
+        matched_rows,
+        adaptive_baseline_method=args.adaptive_baseline_method,
+        adaptive_treatment_method=args.adaptive_treatment_method,
+        matched_baseline_method=args.matched_baseline_method,
+        matched_treatment_method=args.matched_treatment_method,
+        n_bootstrap=args.n_bootstrap,
+        confidence=args.confidence,
+        seed=args.seed,
+    )
+    output_path = _write_json(
+        args.output,
+        {
+            "command": "evaluate-prediction-interaction",
+            "adaptive_input": adaptive_path,
+            "adaptive_input_sha256": sha256_file(adaptive_path),
+            "matched_input": matched_path,
+            "matched_input_sha256": sha256_file(matched_path),
+            "num_adaptive_prediction_rows": len(adaptive_rows),
+            "num_matched_prediction_rows": len(matched_rows),
+            **evaluation,
+        },
+    )
+    print(f"Wrote prediction interaction evaluation to {output_path}")
+    return 0
+
+
 def _run_make_manifests(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     rows = list(iter_jsonl(input_path))
@@ -789,6 +827,33 @@ def build_parser() -> argparse.ArgumentParser:
     predictions.add_argument("--confidence", type=float, default=0.95)
     predictions.add_argument("--seed", type=int, default=0)
     predictions.set_defaults(handler=_run_evaluate_predictions)
+
+    prediction_interaction = subparsers.add_parser(
+        "evaluate-prediction-interaction",
+        help="Bootstrap the change in the SWT-minus-DWT effect after matching.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    prediction_interaction.add_argument(
+        "adaptive_input", help="Adaptive-selection prediction JSONL input."
+    )
+    prediction_interaction.add_argument(
+        "matched_input", help="Matched-cardinality prediction JSONL input."
+    )
+    prediction_interaction.add_argument("output", help="Output summary JSON path.")
+    prediction_interaction.add_argument("--adaptive-baseline-method", default="dwt")
+    prediction_interaction.add_argument("--adaptive-treatment-method", default="swt")
+    prediction_interaction.add_argument(
+        "--matched-baseline-method", default="dwt_matched"
+    )
+    prediction_interaction.add_argument(
+        "--matched-treatment-method", default="swt_matched"
+    )
+    prediction_interaction.add_argument("--n-bootstrap", type=int, default=10_000)
+    prediction_interaction.add_argument("--confidence", type=float, default=0.95)
+    prediction_interaction.add_argument("--seed", type=int, default=0)
+    prediction_interaction.set_defaults(
+        handler=_run_evaluate_prediction_interaction
+    )
 
     manifests = subparsers.add_parser(
         "make-manifests",
