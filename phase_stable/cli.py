@@ -1161,6 +1161,7 @@ def _run_export_keyframes(args: argparse.Namespace) -> int:
         methods=args.methods,
         origin_ids=args.origin_ids,
         strict=not args.allow_partial,
+        allow_annotation_subset=args.allow_annotation_subset,
         expected_budget=args.expected_budget,
     )
     for (method, origin_id), path in sorted(paths.items()):
@@ -1576,7 +1577,16 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--methods", nargs="+")
     export.add_argument("--origin-ids", nargs="+", type=int)
     export.add_argument("--expected-budget", type=int)
-    export.add_argument("--allow-partial", action="store_true")
+    export_completeness = export.add_mutually_exclusive_group()
+    export_completeness.add_argument("--allow-partial", action="store_true")
+    export_completeness.add_argument(
+        "--allow-annotation-subset",
+        action="store_true",
+        help=(
+            "Allow a strict annotation cohort subset while retaining complete "
+            "method/origin coverage."
+        ),
+    )
     export.set_defaults(handler=_run_export_keyframes)
 
     baselines = subparsers.add_parser(

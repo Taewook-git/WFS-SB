@@ -189,6 +189,68 @@ def test_strict_export_rejects_missing_annotation_trace(tmp_path: Path) -> None:
         )
 
 
+def test_strict_annotation_subset_requires_same_cohort_in_every_group(
+    tmp_path: Path,
+) -> None:
+    questions_file = _write_annotations(
+        tmp_path / "videomme.json",
+        [
+            {"video_id": "001", "videoID": "a", "question_id": "001-1"},
+            {"video_id": "002", "videoID": "b", "question_id": "002-1"},
+        ],
+    )
+    rows = [
+        _trace(
+            "videomme",
+            "001",
+            "001-1",
+            method=method,
+            origin_id=origin_id,
+        )
+        for method in ("dwt", "swt")
+        for origin_id in (0, 1)
+    ]
+    exports = build_lmms_keyframe_annotations(
+        rows,
+        benchmark="videomme",
+        questions_file=questions_file,
+        methods=("dwt", "swt"),
+        origin_ids=(0, 1),
+        allow_annotation_subset=True,
+    )
+    assert set(exports) == {("dwt", 0), ("dwt", 1), ("swt", 0), ("swt", 1)}
+    assert all(
+        [row["question_id"] for row in group] == ["001-1"]
+        for group in exports.values()
+    )
+
+
+def test_strict_annotation_subset_rejects_inconsistent_group_items(
+    tmp_path: Path,
+) -> None:
+    questions_file = _write_annotations(
+        tmp_path / "videomme.json",
+        [
+            {"video_id": "001", "videoID": "a", "question_id": "001-1"},
+            {"video_id": "002", "videoID": "b", "question_id": "002-1"},
+        ],
+    )
+    rows = [
+        _trace("videomme", "001", "001-1", method="dwt", origin_id=0),
+        _trace("videomme", "002", "002-1", method="dwt", origin_id=0),
+        _trace("videomme", "001", "001-1", method="swt", origin_id=0),
+    ]
+    with pytest.raises(ExportValidationError, match="inconsistent annotation subset"):
+        build_lmms_keyframe_annotations(
+            rows,
+            benchmark="videomme",
+            questions_file=questions_file,
+            methods=("dwt", "swt"),
+            origin_ids=(0,),
+            allow_annotation_subset=True,
+        )
+
+
 def test_strict_export_rejects_duplicate_trace(tmp_path: Path) -> None:
     questions_file = _write_annotations(
         tmp_path / "lvb.json",

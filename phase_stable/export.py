@@ -188,6 +188,7 @@ def build_lmms_keyframe_annotations(
     methods: Optional[Sequence[str]] = None,
     origin_ids: Optional[Sequence[int]] = None,
     strict: bool = True,
+    allow_annotation_subset: bool = False,
     expected_budget: Optional[int] = None,
 ) -> Dict[ExportKey, list[Dict[str, Any]]]:
     """Join trace rows to official annotations, grouped by method and origin.
@@ -201,6 +202,9 @@ def build_lmms_keyframe_annotations(
         origin_ids: Optional origin subset. By default every observed origin is used.
         strict: Require a rectangular method-by-origin grid and exactly one trace
             for every annotation row in every output file.
+        allow_annotation_subset: With ``strict=True``, permit a cohort containing
+            only a subset of the official annotations while still requiring every
+            method/origin group to contain exactly the same cohort.
         expected_budget: Optional required number of selected frames per row.
 
     Returns:
@@ -319,10 +323,26 @@ def build_lmms_keyframe_annotations(
         raise ExportValidationError(f"missing method/origin trace groups: {formatted}")
 
     annotation_keys = set(annotation_by_key)
+    strict_cohort: Optional[set[tuple[str, str]]] = None
+    if strict and allow_annotation_subset:
+        first_group = min(grouped)
+        strict_cohort = set(grouped[first_group])
+        for group_key, item_frames in grouped.items():
+            item_keys = set(item_frames)
+            if item_keys != strict_cohort:
+                missing = strict_cohort.difference(item_keys)
+                extra = item_keys.difference(strict_cohort)
+                method, origin_id = group_key
+                raise ExportValidationError(
+                    "inconsistent annotation subset for "
+                    f"method={method!r}, origin_id={origin_id}: "
+                    f"missing={len(missing)}, extra={len(extra)}"
+                )
+
     exports: Dict[ExportKey, list[Dict[str, Any]]] = {}
     for group_key in sorted(grouped):
         item_frames = grouped[group_key]
-        if strict:
+        if strict and not allow_annotation_subset:
             missing_items = annotation_keys.difference(item_frames)
             if missing_items:
                 preview = ", ".join(
@@ -373,6 +393,7 @@ def export_lmms_keyframe_jsons(
     methods: Optional[Sequence[str]] = None,
     origin_ids: Optional[Sequence[int]] = None,
     strict: bool = True,
+    allow_annotation_subset: bool = False,
     expected_budget: Optional[int] = None,
     filename_prefix: Optional[str] = None,
 ) -> Dict[ExportKey, Path]:
@@ -387,6 +408,7 @@ def export_lmms_keyframe_jsons(
         methods=methods,
         origin_ids=origin_ids,
         strict=strict,
+        allow_annotation_subset=allow_annotation_subset,
         expected_budget=expected_budget,
     )
     prefix = (
@@ -421,6 +443,7 @@ def export_trace_jsonl(
     methods: Optional[Sequence[str]] = None,
     origin_ids: Optional[Sequence[int]] = None,
     strict: bool = True,
+    allow_annotation_subset: bool = False,
     expected_budget: Optional[int] = None,
     filename_prefix: Optional[str] = None,
 ) -> Dict[ExportKey, Path]:
@@ -435,6 +458,7 @@ def export_trace_jsonl(
         methods=methods,
         origin_ids=origin_ids,
         strict=strict,
+        allow_annotation_subset=allow_annotation_subset,
         expected_budget=expected_budget,
         filename_prefix=filename_prefix,
     )
@@ -478,10 +502,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--origin_ids", default=None, help="Comma-separated origin IDs")
     parser.add_argument("--expected_budget", type=int, default=None)
     parser.add_argument("--filename_prefix", default=None)
-    parser.add_argument(
+    completeness = parser.add_mutually_exclusive_group()
+    completeness.add_argument(
         "--allow_partial",
         action="store_true",
         help="Allow output groups that cover only a subset of annotation rows",
+    )
+    completeness.add_argument(
+        "--allow_annotation_subset",
+        action="store_true",
+        help=(
+            "Allow one strict annotation cohort subset while retaining the complete "
+            "method/origin grid"
+        ),
     )
     return parser
 
@@ -497,6 +530,7 @@ def main() -> None:
         methods=_comma_separated_text(args.methods),
         origin_ids=_comma_separated_ints(args.origin_ids),
         strict=not args.allow_partial,
+        allow_annotation_subset=args.allow_annotation_subset,
         expected_budget=args.expected_budget,
         filename_prefix=args.filename_prefix,
     )

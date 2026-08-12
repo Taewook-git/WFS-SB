@@ -404,7 +404,8 @@ if [[ "${BENCHMARK}" == "videomme" ]]; then
     --traces "${TRACES}" --benchmark videomme \
       --questions-file "${QUESTIONS_FILE}" --dataset-root "${DATASET_ROOT}" \
       --output-dir "${KEYFRAME_DIR}" --methods "${METHODS[@]}" \
-      --origin-ids "${ORIGINS[@]}" --expected-budget "${FRAME_BUDGET}")
+      --origin-ids "${ORIGINS[@]}" --expected-budget "${FRAME_BUDGET}" \
+      --allow-annotation-subset)
 fi
 
 if ((SKIP_MLLM)); then

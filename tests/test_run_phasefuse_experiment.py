@@ -83,6 +83,7 @@ def test_phasefuse_launcher_wires_all_compute_matched_arms_and_safe_resume():
     assert "rm -rf" not in source
     assert "--max-pixels 200704" in source
     assert '--expected-budget "${FRAME_BUDGET}"' in source
+    assert "--allow-annotation-subset" in source
     assert "--baseline-method dense_swt" in source
     assert "--treatment-method phasefuse" in source
     assert '--expected-methods "${METHODS[@]}"' in source
