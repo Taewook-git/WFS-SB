@@ -94,6 +94,34 @@ def select_top_nms_indices(
     return np.asarray(result[1], dtype=int)
 
 
+def select_nested_nms_frontier(
+    values: Sequence[float],
+    max_count: int,
+    min_distance: int,
+    valid_mask: Optional[Sequence[bool]] = None,
+) -> np.ndarray:
+    """Return a deterministic score-ranked frontier with nested prefixes.
+
+    The distance-constrained maximum-score set is solved once at
+    ``max_count``.  Its members are then ordered by descending score (earlier
+    time breaks ties).  Consequently, every prefix is feasible and increasing
+    the requested boundary count adds exactly one boundary without relocating
+    any previously selected boundary.  Prefixes are intentionally *not*
+    re-optimized independently: that would confound cardinality with boundary
+    identity in a B-dose experiment.
+    """
+
+    scores = np.asarray(values, dtype=float)
+    selected = select_top_nms_indices(
+        scores,
+        count=max_count,
+        min_distance=min_distance,
+        valid_mask=valid_mask,
+    )
+    ranked = sorted(selected.tolist(), key=lambda index: (-scores[index], index))
+    return np.asarray(ranked, dtype=int)
+
+
 @dataclass
 class SelectionTrace:
     """All intermediate values needed by the phase-stability experiments."""
@@ -120,7 +148,9 @@ class SelectionTrace:
             "valid_importance_scores": [
                 float(value) for value in self.valid_importance_scores
             ],
-            "allocation": {str(key): int(value) for key, value in self.allocation.items()},
+            "allocation": {
+                str(key): int(value) for key, value in self.allocation.items()
+            },
             "selected_indices": [int(index) for index in self.selected_indices],
             "used_fallback": bool(self.used_fallback),
         }
@@ -180,6 +210,7 @@ class PhaseStableWFS:
         features: Optional[np.ndarray] = None,
         *,
         boundary_count: Optional[int] = None,
+        boundary_indices: Optional[Sequence[int]] = None,
     ) -> SelectionTrace:
         """Run transform, segmentation, budget allocation, and frame selection."""
 
@@ -198,13 +229,36 @@ class PhaseStableWFS:
             or int(boundary_count) <= 0
         ):
             raise ValueError("boundary_count must be a positive integer")
+        if boundary_count is not None and boundary_indices is not None:
+            raise ValueError(
+                "boundary_count and boundary_indices are mutually exclusive"
+            )
+        explicit_peaks: np.ndarray | None = None
+        if boundary_indices is not None:
+            raw_peaks = np.asarray(boundary_indices)
+            if raw_peaks.ndim != 1:
+                raise ValueError("boundary_indices must be one-dimensional")
+            if raw_peaks.dtype.kind not in {"i", "u"}:
+                raise TypeError("boundary_indices must contain integers")
+            explicit_peaks = raw_peaks.astype(int, copy=False)
+            if explicit_peaks.size:
+                if np.any(np.diff(explicit_peaks) <= 0):
+                    raise ValueError("boundary_indices must be strictly increasing")
+                if explicit_peaks[0] <= 0 or explicit_peaks[-1] >= scores.size - 1:
+                    raise ValueError("boundary_indices must exclude signal endpoints")
+                if np.any(np.diff(explicit_peaks) < int(min_peak_distance)):
+                    raise ValueError(
+                        "boundary_indices violate the configured minimum distance"
+                    )
         if features is not None:
             features = np.asarray(features)
             if features.ndim < 2 or features.shape[0] != scores.size:
                 raise ValueError("features must be frame-aligned with relevance_scores")
 
         transform_result = self.transform.transform(scores)
-        if boundary_count is None:
+        if explicit_peaks is not None:
+            peaks = explicit_peaks.copy()
+        elif boundary_count is None:
             peaks = self.event_detector.detect_peaks(
                 transform_result.coarse_detail, min_peak_distance
             )
@@ -301,3 +355,12 @@ class PhaseStableWFS:
         """Return a serializable snapshot of the selection configuration."""
 
         return asdict(self.config)
+
+
+__all__ = [
+    "PhaseStableWFS",
+    "SelectionConfig",
+    "SelectionTrace",
+    "select_nested_nms_frontier",
+    "select_top_nms_indices",
+]

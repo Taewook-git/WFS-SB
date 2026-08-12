@@ -35,6 +35,7 @@ from .benchmarks import (
 from .config import load_phase_stable_config
 from .export import export_trace_jsonl
 from .pipeline import SelectionConfig
+from .policy import run_policy_separation_experiment
 from .repro import sha256_file, write_reproducibility_manifests
 from .sampling import (
     build_sampling_manifest,
@@ -382,6 +383,139 @@ def _run_matched_selection(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_policy_separation(args: argparse.Namespace) -> int:
+    input_path = Path(args.input)
+    output_dir = Path(args.output_dir)
+    config_path = Path(args.config)
+    loaded_config = load_phase_stable_config(config_path)
+    records = read_signal_records(input_path)
+    b_values = tuple(args.b_values)
+    result = run_policy_separation_experiment(
+        records,
+        output_dir,
+        b_values=b_values,
+        config=loaded_config.experiment,
+        selection_config=loaded_config.selection,
+        n_bootstrap=args.n_bootstrap,
+        confidence=args.confidence,
+        seed=args.seed,
+    )
+    protocol = {
+        "inference_status": "exploratory_mechanism_study",
+        "b_grid_status": "predeclared_for_this_run_not_calibration_selected",
+        "primary_endpoint": None,
+        "multiplicity_policy": (
+            "No confirmatory hypothesis testing; report joint video-cluster "
+            "bootstrap intervals as exploratory."
+        ),
+        "topc_candidate_universe": "strict_local_maxima",
+        "nested_b_candidate_universe": "all_valid_interior_samples",
+        "nested_b_estimand": "max-B-anchored nested prefixes, not independent top-B optima",
+    }
+
+    row_keys = (
+        "trace_rows",
+        "item_metric_rows",
+        "peak_rows",
+        "fidelity_rows",
+    )
+    missing = [key for key in row_keys if key not in result]
+    if missing:
+        raise ValueError(
+            "policy-separation result is missing row collections: " + ", ".join(missing)
+        )
+
+    feature_inputs = sorted(
+        {
+            Path(record.visual_features_path)
+            for record in records
+            if record.visual_features_path is not None
+        },
+        key=lambda path: str(path.resolve()),
+    )
+    run_manifest_path, environment_path = write_reproducibility_manifests(
+        output_dir,
+        command="policy-separation",
+        config={
+            "experiment": asdict(loaded_config.experiment),
+            "selection": asdict(loaded_config.selection),
+            "b_values": list(b_values),
+            "n_bootstrap": args.n_bootstrap,
+            "confidence": args.confidence,
+            "seed": args.seed,
+            "protocol": protocol,
+        },
+        input_paths=(input_path, config_path, *feature_inputs),
+        extra={
+            "num_signal_records": len(records),
+            "num_traces": len(result["trace_rows"]),
+            "num_item_metrics": len(result["item_metric_rows"]),
+            "num_peak_rows": len(result["peak_rows"]),
+            "num_fidelity_rows": len(result["fidelity_rows"]),
+        },
+    )
+
+    artifact_candidates = {
+        "traces_jsonl": output_dir / "traces.jsonl",
+        "item_metrics_jsonl": output_dir / "item_metrics.jsonl",
+        "item_metrics_csv": output_dir / "item_metrics.csv",
+        "peak_rows_jsonl": output_dir / "peak_rows.jsonl",
+        "peak_rows_csv": output_dir / "peak_rows.csv",
+        "fidelity_rows_jsonl": output_dir / "fidelity_rows.jsonl",
+        "fidelity_rows_csv": output_dir / "fidelity_rows.csv",
+    }
+    missing_jsonl = [
+        str(path)
+        for name, path in artifact_candidates.items()
+        if name.endswith("_jsonl") and not path.is_file()
+    ]
+    if missing_jsonl:
+        raise FileNotFoundError(
+            "policy-separation did not write required JSONL artifacts: "
+            + ", ".join(missing_jsonl)
+        )
+
+    summary_path = output_dir / "summary.json"
+    summary = {
+        "command": "policy-separation",
+        "input": input_path,
+        "input_sha256": sha256_file(input_path),
+        "output_dir": output_dir,
+        "config_path": config_path,
+        "config_sha256": sha256_file(config_path),
+        "config": loaded_config.experiment,
+        "selection_config": loaded_config.selection,
+        "b_values": list(b_values),
+        "n_bootstrap": args.n_bootstrap,
+        "confidence": args.confidence,
+        "seed": args.seed,
+        "protocol": protocol,
+        "num_signal_records": len(records),
+        "num_traces": len(result["trace_rows"]),
+        "num_item_metrics": len(result["item_metric_rows"]),
+        "num_peak_rows": len(result["peak_rows"]),
+        "num_fidelity_rows": len(result["fidelity_rows"]),
+        "stability_summary": result.get("stability_summary", {}),
+        "peak_summary": result.get("peak_summary", {}),
+        "fidelity_summary": result.get("fidelity_summary", {}),
+        "artifacts": {
+            **{
+                name: path
+                for name, path in artifact_candidates.items()
+                if path.is_file()
+            },
+            "summary_json": summary_path,
+            "run_manifest_json": run_manifest_path,
+            "environment_json": environment_path,
+        },
+    }
+    _write_json(summary_path, summary)
+    print(
+        f"Wrote {len(result['trace_rows'])} policy traces and summary to {output_dir}"
+    )
+    return 0
+
+
 def _run_controlled_shifts(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     signal = np.load(input_path, allow_pickle=False)
@@ -509,7 +643,9 @@ def _run_make_manifests(args: argparse.Namespace) -> int:
     return 0
 
 
-def _select_video_indices(values: Sequence[Any], indices: Sequence[int] | None) -> list[Any]:
+def _select_video_indices(
+    values: Sequence[Any], indices: Sequence[int] | None
+) -> list[Any]:
     if indices is None:
         return list(values)
     selected = []
@@ -557,7 +693,9 @@ def _run_make_benchmark_manifests(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_feature_extractor(feature_model: str, model_path: str | None, device: str | None):
+def _load_feature_extractor(
+    feature_model: str, model_path: str | None, device: str | None
+):
     resolved_model_path = model_path or FEATURE_MODEL_DEFAULTS[feature_model]
     try:
         module = importlib.import_module("preprocess.extract")
@@ -571,7 +709,9 @@ def _load_feature_extractor(feature_model: str, model_path: str | None, device: 
         resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         resolved_device = device
-    extractor = module.build_extractor(feature_model, resolved_model_path, resolved_device)
+    extractor = module.build_extractor(
+        feature_model, resolved_model_path, resolved_device
+    )
     return extractor, resolved_model_path, resolved_device
 
 
@@ -672,7 +812,9 @@ def _run_matched_boundaries(args: argparse.Namespace) -> int:
         with Path(args.counts_json).open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if not isinstance(payload, Mapping):
-            raise ValueError("counts JSON must be an object mapping video IDs to counts")
+            raise ValueError(
+                "counts JSON must be an object mapping video IDs to counts"
+            )
         boundary_counts = {str(key): int(value) for key, value in payload.items()}
     metrics = compute_matched_cardinality_metrics(
         rows,
@@ -694,7 +836,9 @@ def _add_transform_options(parser: argparse.ArgumentParser) -> None:
         help="Temporal transforms to compare (default: dwt swt).",
     )
     parser.add_argument("--wavelet", default="db4", help="PyWavelets family.")
-    parser.add_argument("--level", type=int, default=None, help="Fixed decomposition level.")
+    parser.add_argument(
+        "--level", type=int, default=None, help="Fixed decomposition level."
+    )
     parser.add_argument(
         "--drift-level",
         type=int,
@@ -725,7 +869,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     analyze.add_argument("input", help="OriginSignalRecord JSONL input.")
-    analyze.add_argument("output_dir", help="Directory for traces, metrics, and summary.")
+    analyze.add_argument(
+        "output_dir", help="Directory for traces, metrics, and summary."
+    )
     analyze.add_argument(
         "--config",
         help="Validated YAML config; experiment/selection sections override CLI defaults.",
@@ -797,6 +943,28 @@ def build_parser() -> argparse.ArgumentParser:
     matched_selection.add_argument("--seed", type=int, default=0)
     matched_selection.set_defaults(handler=_run_matched_selection)
 
+    policy_separation = subparsers.add_parser(
+        "policy-separation",
+        help="Compare native, count-preserving, and nested boundary policies.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    policy_separation.add_argument("input", help="OriginSignalRecord JSONL input.")
+    policy_separation.add_argument(
+        "output_dir", help="Directory for policy traces, metrics, and summary."
+    )
+    policy_separation.add_argument("--config", required=True)
+    policy_separation.add_argument(
+        "--b-values",
+        nargs="+",
+        type=int,
+        required=True,
+        help="Increasing unique positive common boundary counts.",
+    )
+    policy_separation.add_argument("--n-bootstrap", type=int, default=10_000)
+    policy_separation.add_argument("--confidence", type=float, default=0.95)
+    policy_separation.add_argument("--seed", type=int, default=0)
+    policy_separation.set_defaults(handler=_run_policy_separation)
+
     shifts = subparsers.add_parser(
         "controlled-shifts",
         help="Measure inverse-aligned circular-shift consistency for a .npy signal.",
@@ -851,9 +1019,7 @@ def build_parser() -> argparse.ArgumentParser:
     prediction_interaction.add_argument("--n-bootstrap", type=int, default=10_000)
     prediction_interaction.add_argument("--confidence", type=float, default=0.95)
     prediction_interaction.add_argument("--seed", type=int, default=0)
-    prediction_interaction.set_defaults(
-        handler=_run_evaluate_prediction_interaction
-    )
+    prediction_interaction.set_defaults(handler=_run_evaluate_prediction_interaction)
 
     manifests = subparsers.add_parser(
         "make-manifests",
@@ -876,7 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_manifests.add_argument(
         "--benchmark",
         required=True,
-        choices=("videomme", "lvb", "longvideobench", "mlvu"),
+        choices=("videomme", "lvb", "longvideobench", "mlvu", "qvhighlights", "qvh"),
     )
     benchmark_manifests.add_argument("--questions-file", required=True)
     benchmark_manifests.add_argument("--dataset-root", required=True)
@@ -901,7 +1067,7 @@ def build_parser() -> argparse.ArgumentParser:
     preprocess.add_argument(
         "--benchmark",
         required=True,
-        choices=("videomme", "lvb", "longvideobench", "mlvu"),
+        choices=("videomme", "lvb", "longvideobench", "mlvu", "qvhighlights", "qvh"),
     )
     preprocess.add_argument("--questions-file", required=True)
     preprocess.add_argument("--dataset-root", required=True)

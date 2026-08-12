@@ -18,15 +18,23 @@ from .preprocess import (
 )
 from .sampling import SamplingManifest, build_sampling_manifest
 
-
-SUPPORTED_BENCHMARKS = {"videomme", "lvb", "longvideobench", "mlvu"}
+SUPPORTED_BENCHMARKS = {
+    "videomme",
+    "lvb",
+    "longvideobench",
+    "mlvu",
+    "qvhighlights",
+    "qvh",
+}
 
 
 def normalize_benchmark(name: str) -> str:
     normalized = str(name).strip().lower()
     if normalized == "longvideobench":
         normalized = "lvb"
-    if normalized not in {"videomme", "lvb", "mlvu"}:
+    if normalized == "qvh":
+        normalized = "qvhighlights"
+    if normalized not in {"videomme", "lvb", "mlvu", "qvhighlights"}:
         raise ValueError(f"unsupported benchmark: {name!r}")
     return normalized
 
@@ -68,10 +76,198 @@ class BenchmarkVideo:
 def _load_rows(path: str | Path) -> list[Mapping[str, Any]]:
     source = Path(path)
     with source.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, list) or any(not isinstance(row, Mapping) for row in payload):
+        if source.suffix.lower() == ".jsonl":
+            payload = []
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"invalid JSONL at line {line_number}: {exc}"
+                    ) from exc
+                payload.append(row)
+        else:
+            payload = json.load(handle)
+    if not isinstance(payload, list) or any(
+        not isinstance(row, Mapping) for row in payload
+    ):
         raise ValueError("benchmark annotation must be a JSON list of objects")
     return payload
+
+
+def _is_official_qvhighlights_row(row: Mapping[str, Any]) -> bool:
+    return "vid" in row or "qid" in row
+
+
+def _qvhighlights_identity(
+    row: Mapping[str, Any], row_index: int
+) -> tuple[str, str, str, Optional[float], Mapping[str, Any]]:
+    """Normalize either official QV JSONL or our phase-manifest schema."""
+
+    if _is_official_qvhighlights_row(row):
+        video_id = _required_text(row, "vid", row_index)
+        question_id = _required_text(row, "qid", row_index)
+        question = _required_text(row, "query", row_index)
+        duration_value = row.get("duration")
+        if (
+            isinstance(duration_value, bool)
+            or not isinstance(duration_value, (int, float))
+            or not math.isfinite(float(duration_value))
+            or float(duration_value) <= 0
+        ):
+            raise ValueError(
+                f"annotation row {row_index} QVHighlights duration must be positive and finite"
+            )
+        duration = float(duration_value)
+        metadata: Mapping[str, Any] = {
+            "relevant_windows_seconds": row.get("relevant_windows"),
+            "relevant_clip_ids": row.get("relevant_clip_ids"),
+            "saliency_votes": row.get("saliency_scores"),
+            "official_row": True,
+        }
+    else:
+        video_id = _required_text(row, "video_id", row_index)
+        question_id = _required_text(row, "query_id", row_index)
+        question = _required_text(row, "query", row_index)
+        duration = _optional_duration(row)
+        metadata_value = row.get("metadata")
+        if not isinstance(metadata_value, Mapping):
+            raise ValueError(
+                f"annotation row {row_index} has invalid QVHighlights metadata"
+            )
+        metadata = metadata_value
+        if duration is None:
+            source_duration = metadata.get("annotation_duration_seconds")
+            if (
+                isinstance(source_duration, bool)
+                or not isinstance(source_duration, (int, float))
+                or not math.isfinite(float(source_duration))
+                or float(source_duration) <= 0
+            ):
+                raise ValueError(
+                    f"annotation row {row_index} has no valid QVHighlights duration"
+                )
+            duration = float(source_duration)
+    return video_id, question_id, question, duration, metadata
+
+
+def _validate_qvhighlights_labels(
+    row: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    row_index: int,
+    duration: Optional[float],
+) -> dict[str, Any]:
+    windows = metadata.get("relevant_windows_seconds")
+    clip_ids = metadata.get("relevant_clip_ids")
+    votes = metadata.get("saliency_votes")
+    if votes is None:
+        votes = metadata.get("saliency_scores")
+    if (
+        not isinstance(windows, Sequence)
+        or isinstance(windows, (str, bytes))
+        or not windows
+    ):
+        raise ValueError(
+            f"annotation row {row_index} has no relevant QVHighlights windows"
+        )
+    normalized_windows: list[list[float]] = []
+    for window in windows:
+        if (
+            not isinstance(window, Sequence)
+            or isinstance(window, (str, bytes))
+            or len(window) != 2
+        ):
+            raise ValueError(
+                f"annotation row {row_index} has an invalid relevant window"
+            )
+        start, stop = float(window[0]), float(window[1])
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(stop)
+            or start < 0
+            or stop <= start
+        ):
+            raise ValueError(
+                f"annotation row {row_index} has an invalid relevant window"
+            )
+        if duration is not None and stop > duration + 1e-6:
+            raise ValueError(
+                f"annotation row {row_index} relevant window exceeds duration"
+            )
+        if normalized_windows and start < normalized_windows[-1][1]:
+            raise ValueError(
+                f"annotation row {row_index} relevant windows overlap or are unsorted"
+            )
+        if not math.isclose(
+            start / 2.0, round(start / 2.0), abs_tol=1e-9
+        ) or not math.isclose(stop / 2.0, round(stop / 2.0), abs_tol=1e-9):
+            raise ValueError(
+                f"annotation row {row_index} QVHighlights windows must align to 2s clips"
+            )
+        normalized_windows.append([start, stop])
+    if (
+        not isinstance(clip_ids, Sequence)
+        or isinstance(clip_ids, (str, bytes))
+        or not isinstance(votes, Sequence)
+        or isinstance(votes, (str, bytes))
+        or len(clip_ids) != len(votes)
+    ):
+        raise ValueError(f"annotation row {row_index} has misaligned highlight labels")
+    normalized_clip_ids: list[int] = []
+    normalized_votes: list[list[int]] = []
+    for clip_id, raw_votes in zip(clip_ids, votes):
+        if isinstance(clip_id, bool) or not isinstance(clip_id, int) or clip_id < 0:
+            raise ValueError(
+                f"annotation row {row_index} has an invalid relevant clip ID"
+            )
+        if duration is not None and clip_id >= int(duration // 2):
+            raise ValueError(
+                f"annotation row {row_index} relevant clip exceeds duration"
+            )
+        if (
+            not isinstance(raw_votes, Sequence)
+            or isinstance(raw_votes, (str, bytes))
+            or len(raw_votes) != 3
+        ):
+            raise ValueError(
+                f"annotation row {row_index} saliency vote must contain 3 annotators"
+            )
+        vote_row: list[int] = []
+        for vote in raw_votes:
+            if (
+                isinstance(vote, bool)
+                or not isinstance(vote, int)
+                or not 0 <= vote <= 4
+            ):
+                raise ValueError(
+                    f"annotation row {row_index} saliency votes must be integers in [0, 4]"
+                )
+            vote_row.append(int(vote))
+        normalized_clip_ids.append(int(clip_id))
+        normalized_votes.append(vote_row)
+    if normalized_clip_ids != sorted(set(normalized_clip_ids)):
+        raise ValueError(
+            f"annotation row {row_index} relevant clip IDs must be unique and sorted"
+        )
+    expected_clip_ids = [
+        clip_id
+        for start, stop in normalized_windows
+        for clip_id in range(round(start / 2.0), round(stop / 2.0))
+    ]
+    if normalized_clip_ids != expected_clip_ids:
+        raise ValueError(
+            f"annotation row {row_index} relevant clips do not match relevant windows"
+        )
+    return {
+        "relevant_windows_sec": normalized_windows,
+        "relevant_clip_ids": normalized_clip_ids,
+        "saliency_votes": normalized_votes,
+        "annotation_fps": float(row.get("fps", 0.0)),
+        "relevant_frame_ranges": row.get("relevant_frame_ranges"),
+        "source_metadata": dict(metadata),
+    }
 
 
 def _required_text(row: Mapping[str, Any], field: str, row_index: int) -> str:
@@ -95,7 +291,9 @@ def _optional_duration(row: Mapping[str, Any]) -> Optional[float]:
 def _query_text(question: str, choices: Sequence[Any], *, include_choices: bool) -> str:
     if not include_choices:
         return question
-    choice_text = " ".join(str(value).strip() for value in choices if str(value).strip())
+    choice_text = " ".join(
+        str(value).strip() for value in choices if str(value).strip()
+    )
     return f"{question} {choice_text}".strip()
 
 
@@ -113,8 +311,17 @@ def load_benchmark_videos(
     order: list[str] = []
 
     for row_index, row in enumerate(rows):
-        question = _required_text(row, "question", row_index)
-        duration = _optional_duration(row)
+        if dataset == "qvhighlights":
+            (
+                qv_video_id,
+                qv_question_id,
+                question,
+                duration,
+                qv_metadata,
+            ) = _qvhighlights_identity(row, row_index)
+        else:
+            question = _required_text(row, "question", row_index)
+            duration = _optional_duration(row)
         if dataset == "videomme":
             video_id = _required_text(row, "video_id", row_index)
             physical_id = _required_text(row, "videoID", row_index)
@@ -128,24 +335,40 @@ def load_benchmark_videos(
             video_path = root / "videos" / _required_text(row, "video_path", row_index)
             choices = row.get("candidates", [])
             query = _query_text(question, choices, include_choices=True)
-        else:
+        elif dataset == "mlvu":
             video_name = _required_text(row, "video_name", row_index)
             video_id = Path(video_name).stem
             question_id = _required_text(row, "question_id", row_index)
             video_path = root / "video" / video_name
             choices = row.get("candidates", [])
             query = _query_text(question, choices, include_choices=False)
+        else:
+            video_id = qv_video_id
+            question_id = qv_question_id
+            video_path = root / "videos" / f"{video_id}.mp4"
+            choices = []
+            query = question
 
         if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)):
             raise ValueError(f"annotation row {row_index} choices must be a sequence")
+        query_metadata: dict[str, Any] = {
+            "annotation_index": row_index,
+            "gold": row.get("answer", row.get("correct_choice")),
+            "choices": list(choices),
+        }
+        if dataset == "qvhighlights":
+            query_metadata.update(
+                _validate_qvhighlights_labels(
+                    row,
+                    qv_metadata,
+                    row_index,
+                    duration,
+                )
+            )
         query_spec = QuerySpec(
             question_id=question_id,
             query=query,
-            metadata={
-                "annotation_index": row_index,
-                "gold": row.get("answer", row.get("correct_choice")),
-                "choices": list(choices),
-            },
+            metadata=query_metadata,
         )
         if video_id not in groups:
             groups[video_id] = {
@@ -166,6 +389,16 @@ def load_benchmark_videos(
             group["duration"] = duration if prior is None else max(prior, duration)
         group["queries"].append(query_spec)
 
+    if dataset == "qvhighlights":
+        seen_question_ids: set[str] = set()
+        for video_id in order:
+            for query in groups[video_id]["queries"]:
+                if query.question_id in seen_question_ids:
+                    raise ValueError(
+                        f"duplicate QVHighlights query_id {query.question_id!r}"
+                    )
+                seen_question_ids.add(query.question_id)
+
     return [
         BenchmarkVideo(
             dataset=dataset,
@@ -178,13 +411,17 @@ def load_benchmark_videos(
     ]
 
 
-def probe_video_duration_pyav(video_path: str | Path, *, stream_index: int = 0) -> float:
+def probe_video_duration_pyav(
+    video_path: str | Path, *, stream_index: int = 0
+) -> float:
     """Read a video's presentation duration without relying on average FPS."""
 
     try:
         av = importlib.import_module("av")
     except (ImportError, ModuleNotFoundError) as exc:
-        raise RuntimeError("PyAV is required; install it with `pip install av`.") from exc
+        raise RuntimeError(
+            "PyAV is required; install it with `pip install av`."
+        ) from exc
     path = Path(video_path)
     if not path.is_file():
         raise FileNotFoundError(f"video file does not exist: {path}")
@@ -277,9 +514,7 @@ def iter_benchmark_signal_records(
             if streaming
             else preprocess_video_manifest
         )
-        extra_kwargs = (
-            {"frame_buffer_size": frame_buffer_size} if streaming else {}
-        )
+        extra_kwargs = {"frame_buffer_size": frame_buffer_size} if streaming else {}
         yield from preprocess_function(
             video.video_path,
             manifest,

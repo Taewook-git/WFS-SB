@@ -54,6 +54,7 @@ def test_parser_and_python_module_help_smoke():
     for command in (
         "analyze-signals",
         "matched-selection",
+        "policy-separation",
         "controlled-shifts",
         "evaluate-prediction-interaction",
         "evaluate-predictions",
@@ -328,3 +329,117 @@ def test_matched_selection_command_writes_isolated_summary(tmp_path: Path):
     ]
     assert len(traces) == 4
     assert all(len(row["peaks"]) == 4 for row in traces)
+
+
+def test_policy_separation_command_writes_summary_and_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "signals.jsonl"
+    output_dir = tmp_path / "policy"
+    config = (
+        Path(__file__).resolve().parents[1] / "configs" / "phase_stable_icassp.yaml"
+    )
+    write_signal_records(
+        source,
+        [
+            OriginSignalRecord(
+                dataset="demo",
+                video_id="v1",
+                question_id="q1",
+                origin_id=0,
+                origin_sec=0.0,
+                timestamps_sec=(0.0, 1.0),
+                actual_pts_sec=(0.0, 1.0),
+                source_frame_indices=(0, 1),
+                relevance_scores=(0.1, 0.2),
+            )
+        ],
+    )
+    observed: dict[str, object] = {}
+
+    def fake_policy(records, destination, **kwargs):
+        observed["record_count"] = len(records)
+        observed["destination"] = Path(destination)
+        observed.update(kwargs)
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        trace_rows = [{"method": "dwt_adaptive"}]
+        metric_rows = [{"method": "dwt_adaptive", "value": 1.0}]
+        peak_rows = [{"base_method": "dwt", "policy_id": "adaptive"}]
+        fidelity_rows: list[dict] = []
+        for name, rows in (
+            ("traces.jsonl", trace_rows),
+            ("item_metrics.jsonl", metric_rows),
+            ("peak_rows.jsonl", peak_rows),
+            ("fidelity_rows.jsonl", fidelity_rows),
+        ):
+            _write_jsonl(destination / name, rows)
+        (destination / "item_metrics.csv").write_text(
+            "method,value\ndwt_adaptive,1.0\n", encoding="utf-8"
+        )
+        return {
+            "trace_rows": trace_rows,
+            "item_metric_rows": metric_rows,
+            "peak_rows": peak_rows,
+            "fidelity_rows": fidelity_rows,
+            "stability_summary": {"aggregate": {"dwt_adaptive": {"value": 1.0}}},
+            "peak_summary": {"num_rows": np.int64(1)},
+            "fidelity_summary": {"num_rows": 0},
+        }
+
+    monkeypatch.setattr(
+        "phase_stable.cli.run_policy_separation_experiment", fake_policy
+    )
+    assert (
+        main(
+            [
+                "policy-separation",
+                str(source),
+                str(output_dir),
+                "--config",
+                str(config),
+                "--b-values",
+                "8",
+                "15",
+                "20",
+                "--n-bootstrap",
+                "23",
+                "--confidence",
+                "0.9",
+                "--seed",
+                "7",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["record_count"] == 1
+    assert observed["destination"] == output_dir
+    assert observed["b_values"] == (8, 15, 20)
+    assert observed["n_bootstrap"] == 23
+    assert observed["confidence"] == pytest.approx(0.9)
+    assert observed["seed"] == 7
+
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["command"] == "policy-separation"
+    assert summary["input_sha256"] == sha256_file(source)
+    assert summary["config_sha256"] == sha256_file(config)
+    assert summary["b_values"] == [8, 15, 20]
+    assert summary["num_signal_records"] == 1
+    assert summary["num_traces"] == 1
+    assert summary["num_item_metrics"] == 1
+    assert summary["num_peak_rows"] == 1
+    assert summary["num_fidelity_rows"] == 0
+    assert summary["peak_summary"]["num_rows"] == 1
+    assert "item_metrics_csv" in summary["artifacts"]
+
+    run_manifest = json.loads(
+        (output_dir / "manifest" / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert run_manifest["command"] == "policy-separation"
+    assert run_manifest["config"]["b_values"] == [8, 15, 20]
+    assert [entry["sha256"] for entry in run_manifest["inputs"][:2]] == [
+        sha256_file(source),
+        sha256_file(config),
+    ]
+    assert (output_dir / "manifest" / "environment.json").is_file()
