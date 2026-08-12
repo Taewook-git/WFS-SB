@@ -1,0 +1,60 @@
+metadata:
+  protocol: phasefuse-icassp-v1
+  status: development_then_locked_confirmatory
+  main_method: phasefuse
+  contribution: physical_phase_marginalization_uncertainty_budget_coupling
+  note: Outer origins are evaluation perturbations and are never fused.
+
+sampling:
+  master_seed: 20260812
+  num_outer_origins: 5
+  base_sample_fps: 1.0
+  num_inner_phases: 4
+  dense_sample_fps: 4.0
+  pts_backend: pyav
+  nearest_tie_break: earlier
+
+phasefuse:
+  methods:
+    - uniform_dense
+    - dense_topk_mmr
+    - single_dwt
+    - single_swt
+    - multiphase_dwt
+    - multiphase_swt_mean
+    - dense_swt
+    - phasefuse
+  frame_budget: 16
+  num_phases: 4
+  min_frames_per_segment: 2
+  wavelet: db4
+  level: null
+  drift_level: 3
+  dwt_mode: symmetric
+  shared_padding: true
+  padding_mode: reflect
+  swt_norm: true
+  min_boundary_distance_sec: 5.0
+  boundary_threshold_mad: 0.5
+  uncertainty_penalty: 0.25
+  relevance_weight: 0.5
+  phase_vote_weight: 0.25
+  segment_duration_weight: 0.2
+  segment_relevance_weight: 0.4
+  segment_event_weight: 0.3
+  segment_diversity_weight: 0.1
+  segment_uncertainty_penalty: 0.1
+  allocation_temperature: 1.0
+  mmr_lambda: 0.7
+  mmr_visual_weight: 0.75
+  temporal_redundancy_scale_sec: 2.0
+  legacy_selection:
+    height_factor: 0.5
+    prominence_factor: 0.05
+    w_duration: 0.4
+    w_mean: 0.2
+    w_max: 0.3
+    w_var: 0.1
+    strictness_factor: 1.2
+    temperature: 1.0
+    lambda_param: 0.5

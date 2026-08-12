@@ -236,6 +236,24 @@ def test_success_requires_logs_then_marker_and_valid_marker_resumes(tmp_path: Pa
         "call",
     ]
 
+    changed_runtime = _run(
+        *arguments,
+        "--attention",
+        "eager",
+        "--runtime-signature",
+        "new-code-and-model-provenance",
+        env=environment,
+    )
+    assert changed_runtime.returncode == 0, changed_runtime.stderr
+    assert "stale completion marker" in changed_runtime.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "call",
+        "call",
+        "call",
+        "call",
+        "call",
+    ]
+
 
 def test_zero_exit_without_expected_lmms_logs_fails_without_marker(tmp_path: Path):
     keyframes = tmp_path / "keyframes"

@@ -25,15 +25,33 @@ from .analysis import (
     run_matched_selection_experiment,
     run_real_origin_experiment,
 )
-from .artifacts import iter_jsonl, read_signal_records
+from .artifacts import (
+    iter_jsonl,
+    read_signal_records,
+    write_signal_records,
+)
 from .baselines import run_selection_baselines
 from .benchmarks import (
     build_benchmark_manifests,
     load_benchmark_videos,
     preprocess_benchmark_to_jsonl,
+    probe_video_duration_pyav,
 )
 from .config import load_phase_stable_config
 from .export import export_trace_jsonl
+from .multiphase import build_multiphase_manifest
+from .phasefuse_analysis import (
+    categorize_prediction_stability,
+    evaluate_phasefuse_analysis,
+    evaluate_prediction_failure_calibration,
+    evaluate_prediction_stability_rows,
+)
+from .phasefuse_experiment import (
+    PHASEFUSE_METHODS,
+    load_phasefuse_config,
+    run_phasefuse_experiment,
+)
+from .phasefuse_preprocess import preprocess_multiphase_video_streaming
 from .pipeline import SelectionConfig
 from .policy import run_policy_separation_experiment
 from .repro import sha256_file, write_reproducibility_manifests
@@ -130,6 +148,26 @@ def _write_jsonl(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> Path:
             handle.write("\n")
     temporary.replace(destination)
     return destination
+
+
+def _artifact_bundle_rows(paths: Sequence[str | Path]) -> list[dict[str, Any]]:
+    """Hash a deterministic list of material artifacts for strict resume."""
+
+    resolved = sorted({Path(path).resolve() for path in paths}, key=str)
+    if not resolved:
+        raise ValueError("artifact bundle must not be empty")
+    rows: list[dict[str, Any]] = []
+    for path in resolved:
+        if not path.is_file():
+            raise FileNotFoundError(f"artifact bundle member does not exist: {path}")
+        rows.append(
+            {
+                "path": path,
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return rows
 
 
 def _csv_cell(value: Any) -> Any:
@@ -696,7 +734,21 @@ def _run_make_benchmark_manifests(args: argparse.Namespace) -> int:
 def _load_feature_extractor(
     feature_model: str, model_path: str | None, device: str | None
 ):
-    resolved_model_path = model_path or FEATURE_MODEL_DEFAULTS[feature_model]
+    requested_model_path = model_path or FEATURE_MODEL_DEFAULTS[feature_model]
+    candidate = Path(requested_model_path).expanduser()
+    if candidate.exists():
+        resolved_model_path = str(candidate.resolve())
+    else:
+        try:
+            hub = importlib.import_module("huggingface_hub")
+            resolved_model_path = str(
+                Path(hub.snapshot_download(repo_id=requested_model_path)).resolve()
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                "huggingface_hub is required to resolve an immutable feature "
+                "checkpoint snapshot"
+            ) from exc
     try:
         module = importlib.import_module("preprocess.extract")
     except (ImportError, ModuleNotFoundError) as exc:
@@ -729,6 +781,7 @@ def _run_preprocess_benchmark(args: argparse.Namespace) -> int:
         missing = sorted(manifest_ids - known)
         raise ValueError(f"manifest video IDs missing from annotations: {missing[:5]}")
 
+    requested_model_path = args.model_path or FEATURE_MODEL_DEFAULTS[args.feature_model]
     extractor, model_path, device = _load_feature_extractor(
         args.feature_model,
         args.model_path,
@@ -749,6 +802,7 @@ def _run_preprocess_benchmark(args: argparse.Namespace) -> int:
         frame_adapter=image_module.fromarray,
         record_metadata={
             "feature_model": args.feature_model,
+            "feature_model_requested": requested_model_path,
             "feature_model_revision": model_path,
             "feature_device": device,
         },
@@ -759,6 +813,7 @@ def _run_preprocess_benchmark(args: argparse.Namespace) -> int:
         config={
             "benchmark": args.benchmark,
             "feature_model": args.feature_model,
+            "feature_model_requested": requested_model_path,
             "feature_model_revision": model_path,
             "device": device,
             "batch_size": args.batch_size,
@@ -768,6 +823,331 @@ def _run_preprocess_benchmark(args: argparse.Namespace) -> int:
         extra={"signal_jsonl": str(Path(destination).resolve())},
     )
     print(f"Wrote benchmark origin signals to {destination}")
+    return 0
+
+
+def _sampling_integer(payload: Mapping[str, Any], name: str, default: int) -> int:
+    value = payload.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"sampling.{name} must be a positive integer")
+    return int(value)
+
+
+def _sampling_real(payload: Mapping[str, Any], name: str, default: float) -> float:
+    value = payload.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"sampling.{name} must be a positive finite number")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(f"sampling.{name} must be a positive finite number")
+    return result
+
+
+def _run_preprocess_phasefuse(args: argparse.Namespace) -> int:
+    """Build dense physical-phase records without mixing outer origins."""
+
+    config_path = Path(args.config)
+    loaded = load_phasefuse_config(config_path)
+    sampling = loaded.sampling
+    raw_master_seed = sampling.get("master_seed", 0)
+    if isinstance(raw_master_seed, bool) or not isinstance(raw_master_seed, int):
+        raise TypeError("sampling.master_seed must be an integer")
+    master_seed = int(raw_master_seed)
+    num_outer = _sampling_integer(sampling, "num_outer_origins", 5)
+    num_phases = _sampling_integer(sampling, "num_inner_phases", 4)
+    base_fps = _sampling_real(sampling, "base_sample_fps", 1.0)
+    if num_phases != loaded.experiment.num_phases:
+        raise ValueError("sampling.num_inner_phases must equal phasefuse.num_phases")
+    expected_dense_fps = base_fps * num_phases
+    configured_dense_fps = _sampling_real(
+        sampling, "dense_sample_fps", expected_dense_fps
+    )
+    if not math.isclose(configured_dense_fps, expected_dense_fps):
+        raise ValueError(
+            "sampling.dense_sample_fps must equal base_sample_fps*num_inner_phases"
+        )
+
+    videos = load_benchmark_videos(
+        args.benchmark,
+        args.questions_file,
+        args.dataset_root,
+    )
+    videos = _select_video_indices(videos, args.video_indices)
+    if not videos:
+        raise ValueError("PhaseFuse preprocessing requires at least one video")
+    requested_model_path = args.model_path or FEATURE_MODEL_DEFAULTS[args.feature_model]
+    extractor, model_path, device = _load_feature_extractor(
+        args.feature_model,
+        args.model_path,
+        args.device,
+    )
+    try:
+        image_module = importlib.import_module("PIL.Image")
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError("Pillow is required for PhaseFuse preprocessing") from exc
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    manifest_rows = []
+    catalog_rows = []
+    for video in videos:
+        if not video.video_path.is_file():
+            raise FileNotFoundError(
+                f"benchmark video does not exist: {video.video_path}"
+            )
+        duration = (
+            video.duration_sec
+            if video.duration_sec is not None
+            else probe_video_duration_pyav(video.video_path)
+        )
+        manifest = build_multiphase_manifest(
+            video.video_id,
+            duration,
+            base_sample_fps=base_fps,
+            num_phases=num_phases,
+            master_seed=master_seed,
+            num_outer_origins=num_outer,
+        )
+        manifest_rows.append(manifest.to_dict())
+        catalog_rows.append(
+            {
+                "dataset": video.dataset,
+                "video_id": video.video_id,
+                "video_path": video.video_path.resolve(),
+                "duration_sec": duration,
+                "num_questions": len(video.queries),
+                "question_ids": [query.question_id for query in video.queries],
+                "candidate_count_per_phase": manifest.candidate_count_per_phase,
+                "dense_candidate_count": manifest.dense_candidate_count,
+            }
+        )
+        records.extend(
+            preprocess_multiphase_video_streaming(
+                video.video_path,
+                manifest,
+                dataset=video.dataset,
+                queries=video.queries,
+                extractor=extractor,
+                output_dir=output_dir,
+                batch_size=args.batch_size,
+                frame_buffer_size=args.frame_buffer_size,
+                frame_adapter=image_module.fromarray,
+                record_metadata={
+                    "feature_model": args.feature_model,
+                    "feature_model_requested": requested_model_path,
+                    "feature_model_revision": model_path,
+                    "feature_device": device,
+                    "phasefuse_config_sha256": sha256_file(config_path),
+                },
+            )
+        )
+
+    signal_path = Path(args.signal_jsonl)
+    manifest_path = output_dir / "multiphase_manifests.jsonl"
+    catalog_path = output_dir / "catalog.jsonl"
+    feature_bundle_path = output_dir / "feature_bundle.jsonl"
+    source_bundle_path = output_dir / "source_video_bundle.jsonl"
+    write_signal_records(signal_path, records)
+    _write_jsonl(manifest_path, manifest_rows)
+    _write_jsonl(catalog_path, catalog_rows)
+    _write_jsonl(
+        feature_bundle_path,
+        _artifact_bundle_rows(
+            [
+                record.visual_features_path
+                for record in records
+                if record.visual_features_path is not None
+            ]
+        ),
+    )
+    _write_jsonl(
+        source_bundle_path,
+        _artifact_bundle_rows([video.video_path for video in videos]),
+    )
+    run_manifest_path, environment_path = write_reproducibility_manifests(
+        output_dir,
+        command="preprocess-phasefuse",
+        config={
+            "phasefuse": asdict(loaded.experiment),
+            "sampling": dict(sampling),
+            "feature_model": args.feature_model,
+            "feature_model_requested": requested_model_path,
+            "feature_model_revision": model_path,
+            "device": device,
+            "batch_size": args.batch_size,
+            "frame_buffer_size": args.frame_buffer_size,
+            "video_indices": args.video_indices,
+        },
+        input_paths=(args.questions_file, config_path),
+        extra={
+            "num_videos": len(videos),
+            "num_signal_records": len(records),
+            "signal_jsonl": str(signal_path.resolve()),
+        },
+    )
+    _write_json(
+        output_dir / "preprocess_summary.json",
+        {
+            "command": "preprocess-phasefuse",
+            "num_videos": len(videos),
+            "num_signal_records": len(records),
+            "num_outer_origins": num_outer,
+            "num_inner_phases": num_phases,
+            "base_sample_fps": base_fps,
+            "dense_sample_fps": expected_dense_fps,
+            "artifacts": {
+                "signals_jsonl": signal_path,
+                "manifests_jsonl": manifest_path,
+                "catalog_jsonl": catalog_path,
+                "feature_bundle_jsonl": feature_bundle_path,
+                "source_video_bundle_jsonl": source_bundle_path,
+                "run_manifest_json": run_manifest_path,
+                "environment_json": environment_path,
+            },
+        },
+    )
+    print(
+        f"Wrote {len(records)} dense PhaseFuse signals for {len(videos)} videos "
+        f"to {signal_path}"
+    )
+    return 0
+
+
+def _run_phasefuse(args: argparse.Namespace) -> int:
+    input_path = Path(args.input)
+    config_path = Path(args.config)
+    output_dir = Path(args.output_dir)
+    loaded = load_phasefuse_config(config_path)
+    records = read_signal_records(input_path)
+    methods = (
+        tuple(args.methods) if args.methods is not None else loaded.experiment.methods
+    )
+    rows = run_phasefuse_experiment(
+        records,
+        output_dir,
+        config=loaded.experiment,
+        methods=methods,
+    )
+    trace_array_bundle_path = _write_jsonl(
+        output_dir / "trace_array_bundle.jsonl",
+        _artifact_bundle_rows([row["array_path"] for row in rows]),
+    )
+    if args.baseline_method not in methods or args.treatment_method not in methods:
+        raise ValueError("analysis baseline/treatment methods must be among --methods")
+    qv_records = (
+        records
+        if records and all(record.dataset == "qvhighlights" for record in records)
+        else None
+    )
+    analysis = evaluate_phasefuse_analysis(
+        rows,
+        baseline_method=args.baseline_method,
+        treatment_method=args.treatment_method,
+        qv_records=qv_records,
+        n_bootstrap=args.n_bootstrap,
+        confidence=args.confidence,
+        seed=args.seed,
+    )
+    analysis_path = _write_json(output_dir / "analysis_summary.json", analysis)
+    feature_inputs = sorted(
+        {
+            Path(record.visual_features_path)
+            for record in records
+            if record.visual_features_path is not None
+        },
+        key=lambda path: str(path.resolve()),
+    )
+    run_manifest_path, environment_path = write_reproducibility_manifests(
+        output_dir,
+        command="run-phasefuse",
+        config={
+            "phasefuse": asdict(loaded.experiment),
+            "methods": list(methods),
+            "baseline_method": args.baseline_method,
+            "treatment_method": args.treatment_method,
+            "n_bootstrap": args.n_bootstrap,
+            "confidence": args.confidence,
+            "seed": args.seed,
+        },
+        input_paths=(input_path, config_path, *feature_inputs),
+        extra={
+            "num_signal_records": len(records),
+            "num_trace_rows": len(rows),
+            "trace_array_bundle_jsonl": str(trace_array_bundle_path.resolve()),
+        },
+    )
+    print(f"Wrote {len(rows)} PhaseFuse traces to {output_dir}")
+    print(f"Analysis: {analysis_path}")
+    print(f"Run manifest: {run_manifest_path}")
+    print(f"Environment: {environment_path}")
+    return 0
+
+
+def _run_analyze_phasefuse(args: argparse.Namespace) -> int:
+    rows = list(iter_jsonl(args.traces))
+    qv_records = None if args.signals is None else read_signal_records(args.signals)
+    result = evaluate_phasefuse_analysis(
+        rows,
+        baseline_method=args.baseline_method,
+        treatment_method=args.treatment_method,
+        qv_records=qv_records,
+        n_bootstrap=args.n_bootstrap,
+        confidence=args.confidence,
+        seed=args.seed,
+    )
+    output = _write_json(args.output, result)
+    print(f"Wrote PhaseFuse comparison to {output}")
+    return 0
+
+
+def _run_evaluate_phasefuse_predictions(args: argparse.Namespace) -> int:
+    prediction_path = Path(args.predictions)
+    trace_path = Path(args.traces)
+    predictions = list(iter_jsonl(prediction_path))
+    traces = list(iter_jsonl(trace_path))
+    if not predictions or not traces:
+        raise ValueError("prediction and trace JSONL inputs must be non-empty")
+    observed_methods = {
+        row.get("method") for row in predictions if isinstance(row, Mapping)
+    }
+    if args.expected_methods is not None and observed_methods != set(
+        args.expected_methods
+    ):
+        raise ValueError(
+            "prediction methods do not match --expected-methods exactly: "
+            f"observed={sorted(str(value) for value in observed_methods)}"
+        )
+    stability = evaluate_prediction_stability_rows(
+        predictions,
+        baseline_method=args.baseline_method,
+        treatment_method=args.treatment_method,
+        n_bootstrap=args.n_bootstrap,
+        confidence=args.confidence,
+        seed=args.seed,
+    )
+    all_methods = categorize_prediction_stability(predictions)
+    calibration = evaluate_prediction_failure_calibration(
+        traces,
+        predictions,
+        methods=(args.baseline_method, args.treatment_method),
+    )
+    output = _write_json(
+        args.output,
+        {
+            "command": "evaluate-phasefuse-predictions",
+            "predictions": prediction_path,
+            "predictions_sha256": sha256_file(prediction_path),
+            "traces": trace_path,
+            "traces_sha256": sha256_file(trace_path),
+            "num_prediction_rows": len(predictions),
+            "num_trace_rows": len(traces),
+            "stability": stability,
+            "all_methods": all_methods,
+            "uncertainty_failure_calibration": calibration,
+        },
+    )
+    print(f"Wrote PhaseFuse downstream analysis to {output}")
     return 0
 
 
@@ -965,6 +1345,68 @@ def build_parser() -> argparse.ArgumentParser:
     policy_separation.add_argument("--seed", type=int, default=0)
     policy_separation.set_defaults(handler=_run_policy_separation)
 
+    phasefuse_run = subparsers.add_parser(
+        "run-phasefuse",
+        help="Run compute-matched PhaseFuse and ablation selectors on dense signals.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    phasefuse_run.add_argument("input", help="Dense OriginSignalRecord JSONL input.")
+    phasefuse_run.add_argument(
+        "output_dir", help="Trace and analysis output directory."
+    )
+    phasefuse_run.add_argument("--config", required=True)
+    phasefuse_run.add_argument(
+        "--methods",
+        nargs="+",
+        choices=PHASEFUSE_METHODS,
+        help="Subset of config-enabled arms; omitted runs every configured arm.",
+    )
+    phasefuse_run.add_argument("--baseline-method", default="dense_swt")
+    phasefuse_run.add_argument("--treatment-method", default="phasefuse")
+    phasefuse_run.add_argument("--n-bootstrap", type=int, default=10_000)
+    phasefuse_run.add_argument("--confidence", type=float, default=0.95)
+    phasefuse_run.add_argument("--seed", type=int, default=0)
+    phasefuse_run.set_defaults(handler=_run_phasefuse)
+
+    phasefuse_analysis = subparsers.add_parser(
+        "analyze-phasefuse",
+        help="Strict paired PhaseFuse trace comparison and uncertainty calibration.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    phasefuse_analysis.add_argument("--traces", required=True)
+    phasefuse_analysis.add_argument("--output", required=True)
+    phasefuse_analysis.add_argument(
+        "--signals",
+        help="Optional QVHighlights dense signals for independent evidence fidelity.",
+    )
+    phasefuse_analysis.add_argument("--baseline-method", required=True)
+    phasefuse_analysis.add_argument("--treatment-method", required=True)
+    phasefuse_analysis.add_argument("--n-bootstrap", type=int, default=10_000)
+    phasefuse_analysis.add_argument("--confidence", type=float, default=0.95)
+    phasefuse_analysis.add_argument("--seed", type=int, default=0)
+    phasefuse_analysis.set_defaults(handler=_run_analyze_phasefuse)
+
+    phasefuse_predictions = subparsers.add_parser(
+        "evaluate-phasefuse-predictions",
+        help="Analyze stable-correct/wrong outcomes and PhaseFuse uncertainty.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    phasefuse_predictions.add_argument("--predictions", required=True)
+    phasefuse_predictions.add_argument("--traces", required=True)
+    phasefuse_predictions.add_argument("--output", required=True)
+    phasefuse_predictions.add_argument("--baseline-method", default="dense_swt")
+    phasefuse_predictions.add_argument("--treatment-method", default="phasefuse")
+    phasefuse_predictions.add_argument(
+        "--expected-methods",
+        nargs="+",
+        choices=PHASEFUSE_METHODS,
+        help="Require this exact complete method set before downstream analysis.",
+    )
+    phasefuse_predictions.add_argument("--n-bootstrap", type=int, default=10_000)
+    phasefuse_predictions.add_argument("--confidence", type=float, default=0.95)
+    phasefuse_predictions.add_argument("--seed", type=int, default=0)
+    phasefuse_predictions.set_defaults(handler=_run_evaluate_phasefuse_predictions)
+
     shifts = subparsers.add_parser(
         "controlled-shifts",
         help="Measure inverse-aligned circular-shift consistency for a .npy signal.",
@@ -1089,6 +1531,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum matched RGB targets held in host RAM before extraction.",
     )
     preprocess.set_defaults(handler=_run_preprocess_benchmark)
+
+    phasefuse_preprocess = subparsers.add_parser(
+        "preprocess-phasefuse",
+        help="Decode dense interleaved physical phases and cache query features.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    phasefuse_preprocess.add_argument(
+        "--benchmark",
+        required=True,
+        choices=("videomme", "lvb", "longvideobench", "mlvu", "qvhighlights", "qvh"),
+    )
+    phasefuse_preprocess.add_argument("--questions-file", required=True)
+    phasefuse_preprocess.add_argument("--dataset-root", required=True)
+    phasefuse_preprocess.add_argument("--output-dir", required=True)
+    phasefuse_preprocess.add_argument("--signal-jsonl", required=True)
+    phasefuse_preprocess.add_argument("--config", required=True)
+    phasefuse_preprocess.add_argument("--video-indices", nargs="+", type=int)
+    phasefuse_preprocess.add_argument(
+        "--feature-model",
+        choices=tuple(FEATURE_MODEL_DEFAULTS),
+        default="blip2",
+    )
+    phasefuse_preprocess.add_argument("--model-path")
+    phasefuse_preprocess.add_argument("--device")
+    phasefuse_preprocess.add_argument("--batch-size", type=int, default=32)
+    phasefuse_preprocess.add_argument("--frame-buffer-size", type=int, default=256)
+    phasefuse_preprocess.set_defaults(handler=_run_preprocess_phasefuse)
 
     export = subparsers.add_parser(
         "export-keyframes",

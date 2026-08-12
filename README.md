@@ -278,4 +278,4 @@ If you find this project useful, please cite our paper:
 }
 ```
 
-Phase-stable DWT/SWT sampling-origin 실험은 [A100_QUICKSTART.md](A100_QUICKSTART.md)의 원클릭 서버 실행과 [PHASE_STABLE_EXPERIMENTS.md](PHASE_STABLE_EXPERIMENTS.md)의 전체 protocol/artifact schema를 참고하세요.
+Phase-stable DWT/SWT sampling-origin 실험은 [A100_QUICKSTART.md](A100_QUICKSTART.md)의 원클릭 서버 실행과 [PHASE_STABLE_EXPERIMENTS.md](PHASE_STABLE_EXPERIMENTS.md)의 전체 protocol/artifact schema를 참고하세요. TI-DWT를 내부 안정화 블록으로 사용하는 multi-physical-phase tokenizer와 ICASSP 확장 실험은 [PHASEFUSE_EXPERIMENTS.md](PHASEFUSE_EXPERIMENTS.md)에 정리되어 있습니다.

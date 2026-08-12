@@ -43,6 +43,8 @@ Model/runtime options:
   --limit N              Optional lmms-eval smoke-test item limit
   --predictions-output F Merged 7-field JSONL output
                          (default: <output-root>/<benchmark>/predictions.jsonl)
+  --runtime-signature S  Optional immutable caller provenance included in every
+                         cell fingerprint (code/model/package signature)
   --no-convert           Keep verified sample logs but skip prediction merging
   --force                Re-run cells even when a valid completion marker exists
   --dry-run              Validate inputs and print commands without running or writing
@@ -312,6 +314,7 @@ CONVERTER_PYTHON="python"
 REPO_ROOT_RAW="${DEFAULT_REPO_ROOT}"
 LIMIT=""
 PREDICTIONS_OUTPUT_RAW=""
+RUNTIME_SIGNATURE=""
 CONVERT_PREDICTIONS=1
 FORCE=0
 DRY_RUN=0
@@ -415,6 +418,11 @@ while (($#)); do
     --predictions-output)
       (($# >= 2)) || die "--predictions-output requires a value"
       PREDICTIONS_OUTPUT_RAW="$2"
+      shift 2
+      ;;
+    --runtime-signature)
+      (($# >= 2)) || die "--runtime-signature requires a value"
+      RUNTIME_SIGNATURE="$2"
       shift 2
       ;;
     --no-convert)
@@ -575,6 +583,9 @@ for method in "${METHODS[@]}"; do
       "seed=0" \
       "log_samples=true" \
       "python_bin=${PYTHON_BIN}")"
+    if [[ -n "${RUNTIME_SIGNATURE}" ]]; then
+      fingerprint_payload+=$'\n'"runtime_signature=${RUNTIME_SIGNATURE}"
+    fi
     config_fingerprint="$(sha256_text "${fingerprint_payload}")"
 
     if ((DRY_RUN)); then
