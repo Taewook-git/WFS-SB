@@ -16,6 +16,8 @@
     "annotation_sha256": "cc02294caaebdc6f07d9a850c84d6cda5978609c1884c91adc3dbcec90deed44",
     "annotation_size_bytes": 1353093,
     "cohort_path": "protocols/nested_r2_n30_cohort.tsv",
+    "cohort_generator_path": "scripts/build_nested_r2_holdout_protocols.py",
+    "cohort_generator_sha256": "b898b31aed71f0c51d47e9b468fd58c8b25916a7e55df3b951bd51be23bc3a3e",
     "cohort_sha256": "caddfd261119366048e1180420987d7b1f2b4b3327cc22fb1398d1a3c21f57cd",
     "cohort_size_bytes": 1215,
     "cohort_num_videos": 30,

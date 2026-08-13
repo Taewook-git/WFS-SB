@@ -24,6 +24,8 @@
     "excluded_sources_size_bytes": 1056,
     "excluded_sources_count": 88,
     "cohort_path": "protocols/nested_r2_qv_holdout_cohort.tsv",
+    "cohort_generator_path": "scripts/build_nested_r2_holdout_protocols.py",
+    "cohort_generator_sha256": "b898b31aed71f0c51d47e9b468fd58c8b25916a7e55df3b951bd51be23bc3a3e",
     "cohort_sha256": "349f450a169fc1160429738f30028f38b6401b5f33c3760d02d70b3111ccb3b4",
     "cohort_size_bytes": 4777,
     "cohort_num_sources": 100,
