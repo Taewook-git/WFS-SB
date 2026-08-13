@@ -11,7 +11,11 @@ from pathlib import Path
 
 
 def evaluate_gate(summary: dict, treatment_method: str) -> dict:
-    if treatment_method not in {"phasefuse_rc12", "phasefuse_rc14"}:
+    if treatment_method not in {
+        "phasefuse_rc12",
+        "phasefuse_rc14",
+        "phasefuse_nested_r2",
+    }:
         raise ValueError("unsupported canonical residual treatment")
     stability = summary.get("stability")
     if not isinstance(stability, dict):
@@ -69,13 +73,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--treatment-method",
-        choices=("phasefuse_rc12", "phasefuse_rc14"),
+        choices=("phasefuse_rc12", "phasefuse_rc14", "phasefuse_nested_r2"),
         required=True,
     )
     args = parser.parse_args()
-    result = evaluate_gate(
-        json.loads(args.summary.read_text()), args.treatment_method
-    )
+    result = evaluate_gate(json.loads(args.summary.read_text()), args.treatment_method)
     result["downstream_summary_sha256"] = hashlib.sha256(
         args.summary.read_bytes()
     ).hexdigest()

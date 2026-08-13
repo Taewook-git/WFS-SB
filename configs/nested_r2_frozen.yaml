@@ -1,0 +1,50 @@
+method:
+  name: nested_r2
+  schema_version: 1
+  frame_budget: 16
+  base_control: canonical_uniform_a16
+  minimum_exact_control_slots_retained: 14
+  maximum_relocations: 2
+  donor_slots: interior_only
+  protect_edge_anchors: true
+  forbid_adjacent_donor_slots: true
+  candidate_region: nearest_base_anchor_voronoi
+  voronoi_midpoint_tie: earlier_anchor
+  require_strict_quantized_gain: true
+  min_relocation_distance_sec: 2.0
+  distance_relaxation_allowed: false
+  coverage_tiebreak_cap_sec: 8.0
+scoring:
+  source: frozen_rc12_exact
+  max_lattice_hz: 2.0
+  smoothing_sigma_sec: 4.0
+  score_quantum: 0.1
+  lattice_origin_sec: 0.0
+  decision_signal: smoothed_query_relevance_only
+  ti_dwt_role: not_used
+  visual_features_used: false
+  mmr_used: false
+  phase_consensus_used: false
+selection:
+  region_candidate_priority:
+    - quantized_relevance
+    - capped_distance_to_retained_a16
+    - earlier_time
+  joint_subset_priority:
+    - summed_quantized_gain
+    - fewer_relocations_on_exact_gain_tie
+    - summed_candidate_relevance
+    - summed_capped_coverage
+    - earlier_donor_slot
+    - earlier_candidate_time
+decode:
+  mode: canonical_second_stage_nearest_pts
+  midpoint_tie: earlier_pts
+  prohibit_scout_frame_remap: true
+  deduplicate_by: decoded_frame_index
+  dynamic_repair: unchanged_from_rc12
+protocol:
+  status: frozen_before_confirmation_outcomes
+  development_outcomes_used: none
+  rc14_outcomes_used: none
+  comparison: nested_r2_vs_same_canonical_uniform_a16

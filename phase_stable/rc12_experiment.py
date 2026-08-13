@@ -1,4 +1,4 @@
-"""Two-stage PhaseFuse-RC12 exact-resample experiment construction."""
+"""Two-stage canonical-adaptive exact-resample experiment construction."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from .artifacts import OriginSignalRecord, write_jsonl
+from .canonical_nested_r2 import NestedR2Config, select_nested_r2_targets
 from .canonical_residual import (
     RC12Config,
     select_canonical_uniform_targets,
@@ -119,12 +120,18 @@ def build_decision_specs(
 
     resolved = config or RC12Config()
     expected_anchors = {"phasefuse_rc12": 12, "phasefuse_rc14": 14}
-    if treatment_method not in expected_anchors:
-        raise ValueError("treatment_method must be phasefuse_rc12 or phasefuse_rc14")
-    if resolved.anchor_count != expected_anchors[treatment_method]:
+    supported = {*expected_anchors, "phasefuse_nested_r2"}
+    if treatment_method not in supported:
+        raise ValueError(f"treatment_method must be one of {sorted(supported)}")
+    if (
+        treatment_method in expected_anchors
+        and resolved.anchor_count != expected_anchors[treatment_method]
+    ):
         raise ValueError(
             f"{treatment_method} requires anchor_count={expected_anchors[treatment_method]}"
         )
+    if treatment_method == "phasefuse_nested_r2" and resolved != RC12Config():
+        raise ValueError("phasefuse_nested_r2 requires the frozen default RC12Config")
     rows: list[dict[str, Any]] = []
     for item_key, origins in sorted(_group_records(records).items()):
         dataset, video_id, question_id = item_key
@@ -139,15 +146,31 @@ def build_decision_specs(
         )
         uniform_targets = uniform_lattice[uniform_indices]
         for record in origins:
-            decision = select_rc12_targets(
-                record.timestamps_sec,
-                record.relevance_scores,
-                support_start_sec=support_start,
-                support_stop_sec=support_stop,
-                config=resolved,
-            )
+            if treatment_method == "phasefuse_nested_r2":
+                decision = select_nested_r2_targets(
+                    record.timestamps_sec,
+                    record.relevance_scores,
+                    support_start_sec=support_start,
+                    support_stop_sec=support_stop,
+                    config=NestedR2Config(),
+                )
+                decision_metadata = decision.to_dict(include_arrays=False)
+            else:
+                decision = select_rc12_targets(
+                    record.timestamps_sec,
+                    record.relevance_scores,
+                    support_start_sec=support_start,
+                    support_stop_sec=support_stop,
+                    config=resolved,
+                )
+                decision_metadata = decision.to_dict(
+                    include_arrays=False,
+                    method=("rc14" if treatment_method == "phasefuse_rc14" else "rc12"),
+                )
             if not np.array_equal(decision.lattice_timestamps_sec, uniform_lattice):
-                raise RuntimeError("RC12 and uniform canonical lattices do not align")
+                raise RuntimeError(
+                    "treatment and uniform canonical lattices do not align"
+                )
             common = {
                 "schema_version": 1,
                 "dataset": dataset,
@@ -194,10 +217,7 @@ def build_decision_specs(
                     "quantized_scores": decision.quantized_scores.astype(
                         float
                     ).tolist(),
-                    "decision_metadata": decision.to_dict(
-                        include_arrays=False,
-                        method="rc14" if treatment_method == "phasefuse_rc14" else "rc12",
-                    ),
+                    "decision_metadata": decision_metadata,
                 }
             )
     return rows

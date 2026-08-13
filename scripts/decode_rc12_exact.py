@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fresh-decode frozen RC12 decisions in video-level primary-union batches."""
+"""Fresh-decode frozen canonical decisions in video-level primary-union batches."""
 
 from __future__ import annotations
 
@@ -86,16 +86,47 @@ def _arm(row: Mapping[str, Any]) -> CanonicalArmRequest:
         role = "canonical_uniform"
         primary_sources = ("canonical_uniform_anchor",) * len(targets)
         anchor_indices = set(indices)
-    elif method in {"phasefuse_rc12", "phasefuse_rc14"}:
+    elif method in {
+        "phasefuse_rc12",
+        "phasefuse_rc14",
+        "phasefuse_nested_r2",
+    }:
         label = method.removeprefix("phasefuse_")
         role = label
         decision = row.get("decision_metadata")
         if not isinstance(decision, Mapping):
-            raise ValueError("RC12 decision_metadata is missing")
+            raise ValueError("canonical-adaptive decision_metadata is missing")
         anchors = set(_int_list(decision, "anchor_indices"))
         residuals = set(_int_list(decision, "residual_indices"))
         if anchors | residuals != set(indices) or anchors & residuals:
-            raise ValueError("RC12 anchor/residual provenance does not match targets")
+            raise ValueError(
+                "canonical-adaptive anchor/residual provenance does not match targets"
+            )
+        donor_indices: set[int] = set()
+        if role == "nested_r2":
+            base_uniform = set(_int_list(decision, "base_uniform_indices"))
+            donor_indices = set(_int_list(decision, "donor_indices"))
+            ordered_base = sorted(base_uniform)
+            donor_slots = [
+                slot
+                for slot, index in enumerate(ordered_base)
+                if index in donor_indices
+            ]
+            if (
+                len(base_uniform) != 16
+                or len(donor_indices) > 2
+                or not donor_indices <= base_uniform
+                or bool(residuals & base_uniform)
+                or base_uniform - donor_indices != anchors
+                or len(donor_indices) != len(residuals)
+                or len(anchors) < 14
+                or any(slot in {0, 15} for slot in donor_slots)
+                or any(
+                    right - left <= 1
+                    for left, right in zip(donor_slots, donor_slots[1:])
+                )
+            ):
+                raise ValueError("nested-R2 base/donor provenance contract is invalid")
         primary_sources = tuple(
             f"{label}_anchor" if index in anchors else f"{label}_query_residual"
             for index in indices
@@ -110,6 +141,8 @@ def _arm(row: Mapping[str, Any]) -> CanonicalArmRequest:
             if role == "canonical_uniform"
             else f"{label}_anchor_candidate"
             if index in anchor_indices
+            else f"{label}_uniform_donor_candidate"
+            if role == "nested_r2" and index in donor_indices
             else f"{label}_query_residual_candidate"
         )
         for index in range(len(lattice))
@@ -132,7 +165,11 @@ def build_request_pairs(
     *,
     treatment_method: str = "phasefuse_rc12",
 ) -> tuple[dict[str, list[CanonicalRequestPair]], dict[str, dict[str, Any]]]:
-    if treatment_method not in {"phasefuse_rc12", "phasefuse_rc14"}:
+    if treatment_method not in {
+        "phasefuse_rc12",
+        "phasefuse_rc14",
+        "phasefuse_nested_r2",
+    }:
         raise ValueError("unsupported canonical residual treatment method")
     methods = ("canonical_uniform", treatment_method)
     cells: dict[tuple[str, str, str, int], dict[str, Mapping[str, Any]]] = defaultdict(
@@ -358,7 +395,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--treatment-method",
-        choices=("phasefuse_rc12", "phasefuse_rc14"),
+        choices=("phasefuse_rc12", "phasefuse_rc14", "phasefuse_nested_r2"),
         default="phasefuse_rc12",
     )
     parser.add_argument("--treatment-only", action="store_true")

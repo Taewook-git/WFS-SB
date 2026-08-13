@@ -41,6 +41,7 @@ PHASEFUSE_ANALYSIS_METHODS = (
     "canonical_uniform",
     "phasefuse_rc12",
     "phasefuse_rc14",
+    "phasefuse_nested_r2",
 )
 
 

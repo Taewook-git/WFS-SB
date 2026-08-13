@@ -98,6 +98,49 @@ def test_load_video_contracts_requires_aligned_video_grid(tmp_path: Path):
     assert result["v1"]["support_start_sec"] == 0.5
 
 
+def test_nested_r2_decision_specs_are_nested_inside_the_exact_uniform_control(
+    tmp_path: Path,
+):
+    manifest, records = _records(tmp_path)
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"placeholder")
+    contract = {
+        "v1": {
+            "video_path": str(video),
+            "duration_sec": 40.0,
+            "support_start_sec": manifest.common_valid_support_sec[0],
+            "support_stop_sec": manifest.common_valid_support_sec[1],
+        }
+    }
+    rows = build_decision_specs(
+        records, contract, treatment_method="phasefuse_nested_r2"
+    )
+
+    assert {row["method"] for row in rows} == {
+        "canonical_uniform",
+        "phasefuse_nested_r2",
+    }
+    by_origin = {}
+    for row in rows:
+        by_origin.setdefault(row["origin_id"], {})[row["method"]] = row
+    for arms in by_origin.values():
+        uniform = arms["canonical_uniform"]
+        nested = arms["phasefuse_nested_r2"]
+        assert len(set(uniform["target_indices"]) & set(nested["target_indices"])) >= 14
+        assert nested["decision_metadata"]["method"] == "nested_r2"
+        assert nested["decision_metadata"]["ti_dwt_role"] == "not_used"
+        assert (
+            nested["decision_metadata"]["base_uniform_indices"]
+            == uniform["target_indices"]
+        )
+    full = []
+    for question in ("q1", "q2", "q3"):
+        full.extend({**row, "question_id": question} for row in rows)
+    pairs, _ = build_request_pairs(full, treatment_method="phasefuse_nested_r2")
+    assert len(pairs[str(video.resolve())]) == 15
+    assert all(pair.rc12.role == "nested_r2" for pair in pairs[str(video.resolve())])
+
+
 def test_decode_adapter_requires_full_video_batch_and_one_path_contract(tmp_path: Path):
     manifest, records = _records(tmp_path)
     video = tmp_path / "v.mp4"

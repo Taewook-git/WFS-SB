@@ -146,8 +146,15 @@ class CanonicalArmRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.method, str) or not self.method.strip():
             raise ValueError("method must be a non-empty string")
-        if self.role not in {"rc12", "rc14", "canonical_uniform"}:
-            raise ValueError("role must be 'rc12', 'rc14', or 'canonical_uniform'")
+        if self.role not in {
+            "rc12",
+            "rc14",
+            "nested_r2",
+            "canonical_uniform",
+        }:
+            raise ValueError(
+                "role must be 'rc12', 'rc14', 'nested_r2', or 'canonical_uniform'"
+            )
         primary = _finite_tuple(
             "primary_target_timestamps_sec", self.primary_target_timestamps_sec
         )
@@ -498,7 +505,7 @@ class CanonicalRequestPair:
                 "canonical request pairs require CanonicalArmRequest values"
             )
         if (
-            self.rc12.role not in {"rc12", "rc14"}
+            self.rc12.role not in {"rc12", "rc14", "nested_r2"}
             or self.canonical_uniform.role != "canonical_uniform"
         ):
             raise ValueError(

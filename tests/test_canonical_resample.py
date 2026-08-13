@@ -396,6 +396,33 @@ def test_rc14_role_uses_same_exact_contract_with_truthful_provenance():
 
     assert result.arm("phasefuse_rc14").role == "rc14"
     assert all(
-        attempt.role == "rc14"
-        for attempt in result.arm("phasefuse_rc14").attempts
+        attempt.role == "rc14" for attempt in result.arm("phasefuse_rc14").attempts
+    )
+
+
+def test_nested_r2_role_uses_unchanged_exact_decode_contract():
+    lattice = tuple(map(float, range(20)))
+    pair = CanonicalRequestPair(
+        "nested/o0",
+        _arm(
+            "nested_r2",
+            lattice[:16],
+            lattice,
+            method="phasefuse_nested_r2",
+        ),
+        _arm(
+            "canonical_uniform",
+            lattice[:16],
+            lattice,
+            method="canonical_uniform",
+        ),
+    )
+    result = decode_canonical_request_batch(
+        "nested.mp4", (pair,), decoder=SyntheticVFRDecoder(lattice)
+    ).request("nested/o0")
+
+    assert result.arm("phasefuse_nested_r2").role == "nested_r2"
+    assert all(
+        attempt.role == "nested_r2"
+        for attempt in result.arm("phasefuse_nested_r2").attempts
     )
