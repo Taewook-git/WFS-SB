@@ -1,0 +1,26 @@
+method:
+  name: rc12
+  schema_version: 1
+  frame_budget: 16
+  anchor_count: 12
+  max_lattice_hz: 2.0
+  smoothing_sigma_sec: 4.0
+  score_quantum: 0.1
+  min_residual_distance_sec: 2.0
+  coverage_tiebreak_cap_sec: 8.0
+  lattice_origin_sec: 0.0
+  decision_signal: smoothed_query_relevance_only
+  ti_dwt_role: diagnostic_only
+  visual_features_used: false
+  mmr_used: false
+decode:
+  mode: canonical_second_stage_nearest_pts
+  midpoint_tie: earlier_pts
+  prohibit_scout_frame_remap: true
+  deduplicate_by: decoded_frame_index
+development_support:
+  videomme: shared_manifest_common_valid_support_sec
+  qvhighlights: shared_intersection_max_first_min_last
+protocol:
+  status: frozen_after_cached_selector_gate
+  primary_downstream_comparison: rc12_vs_canonical_uniform
