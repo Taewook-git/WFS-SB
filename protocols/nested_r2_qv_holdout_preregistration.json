@@ -70,8 +70,27 @@
   },
   "execution": {
     "scout_or_outcomes_opened": false,
+    "authorization": "stage0_selector_only_no_qwen",
+    "stage0_scout_contract": {
+      "dataset_root": "/home/elicer/videounderstanding/outputs/local-data/qvhighlights",
+      "videos_root": "/home/elicer/videounderstanding/outputs/local-data/qvhighlights/videos",
+      "master_seed": 20260810,
+      "num_outer_origins": 5,
+      "sample_fps": 1.0,
+      "sampling_structure": "single_physical_stream_per_outer_origin",
+      "four_phase_dense_interleave": false,
+      "feature_model": "blip2",
+      "feature_checkpoint_path": "/home/elicer/.cache/huggingface/hub/models--Salesforce--blip2-itm-vit-g/snapshots/520bf73fd0ef6ccce791cd3f06908040aef2d8cc",
+      "feature_checkpoint_revision": "520bf73fd0ef6ccce791cd3f06908040aef2d8cc",
+      "feature_checkpoint_content_tree_sha256": "93f537621bfb693fac5a52760a5b83bd93eb3dd1885292e680b62bc81d962b1f"
+    },
+    "blind_label_firewall": {
+      "allowed_before_blind_seal": ["query_text"],
+      "prohibited_before_blind_seal": ["relevant_windows", "relevant_clip_ids", "saliency_scores"],
+      "label_join_after_artifact_seal_only": true
+    },
     "qwen_applicable": false,
-    "current_authorized_scope": "protocol materialization only; no QV scout or outcome evaluation"
+    "current_authorized_scope": "frozen QV Stage0 scout, decision, fresh exact decode, blind artifact seal, and selector endpoint analysis only; no Qwen"
   },
   "stopping_rule": "Run this one frozen QV holdout cohort/configuration only after separate approval. Do not replace sources or tune the selector, cohort, endpoint order, decoding, or bootstrap after any QV holdout scout or outcome is opened. Preserve null and negative results."
 }
