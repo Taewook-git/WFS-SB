@@ -36,6 +36,11 @@ PHASEFUSE_DEFAULT_METHODS = (
     "phasefuse",
 )
 PHASEFUSE_METHODS = (*PHASEFUSE_DEFAULT_METHODS, "phasefuse_v2")
+PHASEFUSE_ANALYSIS_METHODS = (
+    *PHASEFUSE_METHODS,
+    "canonical_uniform",
+    "phasefuse_rc12",
+)
 
 
 @dataclass(frozen=True)
@@ -820,6 +825,7 @@ def load_phasefuse_config(path: str | Path) -> PhaseFuseFileConfig:
 
 
 __all__ = [
+    "PHASEFUSE_ANALYSIS_METHODS",
     "PHASEFUSE_DEFAULT_METHODS",
     "PHASEFUSE_METHODS",
     "PhaseFuseExperimentConfig",

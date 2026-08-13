@@ -47,6 +47,7 @@ from .phasefuse_analysis import (
     evaluate_prediction_stability_rows,
 )
 from .phasefuse_experiment import (
+    PHASEFUSE_ANALYSIS_METHODS,
     PHASEFUSE_METHODS,
     load_phasefuse_config,
     run_phasefuse_experiment,
@@ -1400,7 +1401,7 @@ def build_parser() -> argparse.ArgumentParser:
     phasefuse_predictions.add_argument(
         "--expected-methods",
         nargs="+",
-        choices=PHASEFUSE_METHODS,
+        choices=PHASEFUSE_ANALYSIS_METHODS,
         help="Require this exact complete method set before downstream analysis.",
     )
     phasefuse_predictions.add_argument("--n-bootstrap", type=int, default=10_000)

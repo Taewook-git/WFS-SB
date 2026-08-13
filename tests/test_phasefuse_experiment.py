@@ -15,6 +15,7 @@ from phase_stable.multiphase import (
 )
 from phase_stable.phasefuse_analysis import evaluate_phasefuse_analysis
 from phase_stable.phasefuse_experiment import (
+    PHASEFUSE_ANALYSIS_METHODS,
     PHASEFUSE_DEFAULT_METHODS,
     PHASEFUSE_METHODS,
     PhaseFuseExperimentConfig,
@@ -80,6 +81,10 @@ def test_all_phasefuse_arms_share_candidates_and_emit_exact_source_budget(
     assert "phasefuse_v2" in PHASEFUSE_METHODS
     assert config.methods == PHASEFUSE_DEFAULT_METHODS
     assert "phasefuse_v2" not in config.methods
+    assert "canonical_uniform" not in PHASEFUSE_METHODS
+    assert "phasefuse_rc12" not in PHASEFUSE_METHODS
+    assert "canonical_uniform" in PHASEFUSE_ANALYSIS_METHODS
+    assert "phasefuse_rc12" in PHASEFUSE_ANALYSIS_METHODS
     assert len(rows) == len(records) * len(config.methods)
     assert list(iter_jsonl(tmp_path / "run" / "traces.jsonl")) == rows
     for row in rows:
@@ -309,3 +314,25 @@ def test_phasefuse_cli_commands_are_exposed():
         ]
     )
     assert downstream.baseline_method == "dense_swt"
+    rc12_downstream = parser.parse_args(
+        [
+            "evaluate-phasefuse-predictions",
+            "--predictions",
+            "predictions.jsonl",
+            "--traces",
+            "traces.jsonl",
+            "--output",
+            "summary.json",
+            "--baseline-method",
+            "canonical_uniform",
+            "--treatment-method",
+            "phasefuse_rc12",
+            "--expected-methods",
+            "canonical_uniform",
+            "phasefuse_rc12",
+        ]
+    )
+    assert rc12_downstream.expected_methods == [
+        "canonical_uniform",
+        "phasefuse_rc12",
+    ]
