@@ -76,10 +76,11 @@ def test_selector_ablation_runner_is_isolated_matched_and_provenance_safe() -> N
 def test_frozen_v2_config_remains_unchanged_and_ablation_config_is_separate() -> None:
     original_path = ROOT / "configs" / "phasefuse_v2_dev20.yaml"
     original_bytes = original_path.read_bytes()
-    assert hashlib.sha256(original_bytes).hexdigest() == (
-        "90caec604e757b0e4bd7877f20b72f0265d35bcdff56247ad86abb40e31e149f"
+    canonical_bytes = original_bytes.replace(b"\r\n", b"\n")
+    assert hashlib.sha256(canonical_bytes).hexdigest() == (
+        "77c0c8bf2e9c00d4aa53f0f8cd5acf8e7d1f595c01f5328e5a5756bd7b3bd63e"
     )
-    original = original_bytes.decode("utf-8")
+    original = canonical_bytes.decode("utf-8")
     ablation = (
         ROOT / "configs" / "phasefuse_v2_selector_ablation_dev20.yaml"
     ).read_text(encoding="utf-8")
