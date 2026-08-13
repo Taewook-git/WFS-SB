@@ -219,6 +219,30 @@ def _uniform_anchor_indices(lattice: np.ndarray, count: int) -> np.ndarray:
     return np.asarray(sorted(selected), dtype=int)
 
 
+def select_canonical_uniform_targets(
+    scout_timestamps_sec: Sequence[float],
+    *,
+    support_start_sec: float,
+    support_stop_sec: float,
+    config: RC12Config | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the full canonical lattice and K=16 uniform target indices.
+
+    Fresh-decode duplicate repair must use the full lattice dynamically against
+    the set of accepted decoded frames; it must not consume a static backup list.
+    """
+
+    resolved = config or RC12Config()
+    lattice, _, _ = canonical_lattice(
+        scout_timestamps_sec,
+        support_start_sec=support_start_sec,
+        support_stop_sec=support_stop_sec,
+        config=resolved,
+    )
+    selected = _uniform_anchor_indices(lattice, resolved.frame_budget)
+    return lattice, selected
+
+
 def select_rc12_targets(
     scout_timestamps_sec: Sequence[float],
     relevance_scores: Sequence[float],
@@ -313,5 +337,6 @@ __all__ = [
     "RC12Decision",
     "canonical_lattice",
     "percentile_rank",
+    "select_canonical_uniform_targets",
     "select_rc12_targets",
 ]

@@ -75,6 +75,7 @@ def test_fresh_vfr_decode_uses_absolute_targets_and_earlier_midpoint_without_sco
         rc12=_arm("rc12", rc12_primary, lattice),
         canonical_uniform=_arm("canonical_uniform", uniform_primary, lattice),
         decoder=decoder,
+        decoder_backend="synthetic_vfr_nearest_pts",
     )
 
     assert len(decoder.calls) == 1
@@ -88,6 +89,7 @@ def test_fresh_vfr_decode_uses_absolute_targets_and_earlier_midpoint_without_sco
     assert midpoint.abs_error_sec == pytest.approx(0.8)
     assert midpoint.decoded_frame_index == 1
     assert result.midpoint_tie_policy == "earlier_pts"
+    assert result.decoder_backend == "synthetic_vfr_nearest_pts"
 
     rows = [
         result.trace_row(
@@ -104,6 +106,15 @@ def test_fresh_vfr_decode_uses_absolute_targets_and_earlier_midpoint_without_sco
     assert rows[0]["actual_pts_sec"] == rows[1]["actual_pts_sec"]
     assert rows[0]["source_frame_indices"] == rows[1]["source_frame_indices"]
     assert all(row["canonical_decode"]["fresh_source_decode"] for row in rows)
+    assert all(
+        row["canonical_decode"]["decoder_backend"] == "synthetic_vfr_nearest_pts"
+        for row in rows
+    )
+    assert all(
+        "decoder_backend" not in attempt
+        for row in rows
+        for attempt in row["canonical_decode"]["attempts"]
+    )
     assert all(row["canonical_decode"]["prohibit_scout_frame_remap"] for row in rows)
     for row in rows:
         _validate_trace_row(row)
@@ -141,6 +152,63 @@ def test_duplicate_winner_and_dynamic_backup_repair_restore_exact_k16():
     assert rc12.attempts[-1].repair_source == "dynamic_frozen_residual_priority"
     assert rc12.attempts[-1].candidate_score == pytest.approx(0.9)
     assert [item.target_sec for item in rc12.selected][-1] == 18.0
+
+
+def test_lower_error_repair_replaces_existing_target_then_continues_to_exact_k():
+    lattice = tuple(map(float, range(14))) + (15.0, 17.0, 19.0, 21.0)
+    primary = tuple(map(float, range(14))) + (15.0, 19.0)
+    scores = np.zeros(len(lattice), dtype=float)
+    scores[lattice.index(17.0)] = 1.0
+    scores[lattice.index(21.0)] = 0.9
+    decoded_pts = (0.5, *map(float, range(2, 14)), 16.5, 19.0, 21.0)
+    pair = CanonicalRequestPair(
+        "replacement",
+        _arm("rc12", primary, lattice, scores=scores, method="rc12"),
+        _arm(
+            "canonical_uniform",
+            primary,
+            lattice,
+            method="canonical_uniform",
+        ),
+    )
+
+    single = decode_canonical_targets(
+        "replacement.mp4",
+        rc12=pair.rc12,
+        canonical_uniform=pair.canonical_uniform,
+        decoder=SyntheticVFRDecoder(decoded_pts),
+    )
+    batch = decode_canonical_request_batch(
+        "replacement.mp4",
+        (pair,),
+        decoder=SyntheticVFRDecoder(decoded_pts),
+    ).request("replacement")
+
+    for result in (single, batch):
+        arm = result.arm("rc12")
+        assert len(arm.selected) == 16
+        assert len({item.decoded_frame_index for item in arm.selected}) == 16
+        assert 15.0 not in [item.target_sec for item in arm.selected]
+        assert 17.0 in [item.target_sec for item in arm.selected]
+        assert 21.0 in [item.target_sec for item in arm.selected]
+        replaced = next(item for item in arm.attempts if item.target_sec == 15.0)
+        winner = next(item for item in arm.attempts if item.target_sec == 17.0)
+        assert replaced.status == "replaced_by_lower_error"
+        assert replaced.duplicate_winner_target_sec == 17.0
+        assert replaced.duplicate_resolution_stage == "repair"
+        assert winner.status == "selected"
+        assert winner.abs_error_sec == pytest.approx(0.5)
+        assert replaced.abs_error_sec == pytest.approx(1.5)
+        assert arm.initial_duplicate_rejection_count == 1
+        assert arm.repair_duplicate_rejection_count == 1
+        assert arm.duplicate_rejection_count == 2
+        assert arm.duplicate_replacement_count == 1
+        assert arm.repair_attempt_count == 2
+        assert sorted(
+            item.target_sec for item in arm.attempts if item.status == "selected"
+        ) == [item.target_sec for item in arm.selected]
+
+    assert single.arm("rc12").to_dict() == batch.arm("rc12").to_dict()
 
 
 def test_repair_distance_relaxes_only_when_no_two_second_candidate_exists():
@@ -184,28 +252,27 @@ def test_lattice_exhaustion_aborts_with_serializable_provenance():
     assert len(provenance["attempts"]) == 16
 
 
-def test_video_batch_decodes_full_canonical_union_once_and_discards_rgb_cache():
+def test_video_batch_decodes_only_primary_union_once_and_discards_rgb_cache():
     lattice = tuple(map(float, range(20)))
-    first_primary = lattice[:16]
-    second_primary = lattice[4:20]
+    primary = lattice[:16]
     decoder = SyntheticVFRDecoder(lattice)
     pairs = (
         CanonicalRequestPair(
             "q0/o0",
-            _arm("rc12", first_primary, lattice, method="rc12"),
+            _arm("rc12", primary, lattice, method="rc12"),
             _arm(
                 "canonical_uniform",
-                second_primary,
+                primary,
                 lattice,
                 method="canonical_uniform",
             ),
         ),
         CanonicalRequestPair(
             "q1/o4",
-            _arm("rc12", second_primary, lattice, method="rc12"),
+            _arm("rc12", primary, lattice, method="rc12"),
             _arm(
                 "canonical_uniform",
-                first_primary,
+                primary,
                 lattice,
                 method="canonical_uniform",
             ),
@@ -215,7 +282,8 @@ def test_video_batch_decodes_full_canonical_union_once_and_discards_rgb_cache():
     batch = decode_canonical_request_batch("one-video.mp4", pairs, decoder=decoder)
 
     assert len(decoder.calls) == 1
-    assert decoder.calls[0][1] == lattice
+    assert decoder.calls[0][1] == primary
+    assert set(decoder.calls[0][1]).isdisjoint(lattice[16:])
     assert tuple(batch.request_results) == ("q0/o0", "q1/o4")
     assert len(batch.decode_passes) == 1
     for request_id in ("q0/o0", "q1/o4"):
@@ -228,3 +296,83 @@ def test_video_batch_decodes_full_canonical_union_once_and_discards_rgb_cache():
             for arm in result.arms.values()
             for attempt in arm.attempts
         )
+
+
+def test_video_batch_unions_one_dynamic_repair_round_and_matches_single_pair():
+    lattice = tuple(map(float, range(21)))
+    primary = lattice[:16]
+    decoded_pts = (0.5, *map(float, range(2, 16)), 20.0)
+    pair = CanonicalRequestPair(
+        "q0/o0",
+        _arm("rc12", primary, lattice, method="rc12"),
+        _arm(
+            "canonical_uniform",
+            primary,
+            lattice,
+            method="canonical_uniform",
+        ),
+    )
+    batch_decoder = SyntheticVFRDecoder(decoded_pts)
+
+    batch = decode_canonical_request_batch(
+        "repair-video.mp4", (pair,), decoder=batch_decoder
+    )
+
+    assert [call[1] for call in batch_decoder.calls] == [primary, (20.0,)]
+    assert len(batch.decode_passes) == 2
+    batched_result = batch.request("q0/o0")
+    assert all(
+        arm.initial_duplicate_rejection_count == 1
+        and arm.repair_attempt_count == 1
+        and len(arm.selected) == 16
+        for arm in batched_result.arms.values()
+    )
+
+    single_decoder = SyntheticVFRDecoder(decoded_pts)
+    single_result = decode_canonical_targets(
+        "repair-video.mp4",
+        rc12=pair.rc12,
+        canonical_uniform=pair.canonical_uniform,
+        decoder=single_decoder,
+    )
+    assert [call[1] for call in single_decoder.calls] == [primary, (20.0,)]
+    for method in ("rc12", "canonical_uniform"):
+        assert (
+            batched_result.arm(method).to_dict() == single_result.arm(method).to_dict()
+        )
+    assert [item.to_dict() for item in batched_result.candidate_union] == [
+        item.to_dict() for item in single_result.candidate_union
+    ]
+
+
+def test_video_batch_rejects_any_cross_request_canonical_lattice_drift():
+    lattice = tuple(map(float, range(20)))
+    shifted = tuple(value + 0.5 for value in lattice)
+    requests = (
+        CanonicalRequestPair(
+            "q0/o0",
+            _arm("rc12", lattice[:16], lattice, method="rc12"),
+            _arm(
+                "canonical_uniform",
+                lattice[:16],
+                lattice,
+                method="canonical_uniform",
+            ),
+        ),
+        CanonicalRequestPair(
+            "q1/o1",
+            _arm("rc12", shifted[:16], shifted, method="rc12"),
+            _arm(
+                "canonical_uniform",
+                shifted[:16],
+                shifted,
+                method="canonical_uniform",
+            ),
+        ),
+    )
+    decoder = SyntheticVFRDecoder(lattice)
+
+    with pytest.raises(ValueError, match="exact same canonical lattice"):
+        decode_canonical_request_batch("drift.mp4", requests, decoder=decoder)
+
+    assert decoder.calls == []

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from numbers import Integral, Real
 from pathlib import Path
@@ -31,6 +31,7 @@ REPAIR_COVERAGE_CAP_SEC = 8.0
 MIDPOINT_TIE_POLICY = "earlier_pts"
 DEFAULT_DECODER_BACKEND = "pyav_sequential_nearest_pts"
 _TIME_TOLERANCE_SEC = 1e-9
+_DUPLICATE_LOSS_STATUSES = frozenset({"rejected_duplicate", "replaced_by_lower_error"})
 
 
 def _finite_tuple(name: str, values: Sequence[Real]) -> tuple[float, ...]:
@@ -238,6 +239,7 @@ class CanonicalTargetAttempt:
     priority_capped_distance_sec: float | None
     status: str
     duplicate_winner_target_sec: float | None = None
+    duplicate_resolution_stage: str | None = None
     rgb: np.ndarray = field(
         repr=False, compare=False, default_factory=lambda: np.empty(0)
     )
@@ -261,13 +263,13 @@ class CanonicalTargetAttempt:
             "decoded_frame_index": self.decoded_frame_index,
             "pixel_hash": self.pixel_hash,
             "decode_pass_index": self.decode_pass_index,
-            "decoder_backend": DEFAULT_DECODER_BACKEND,
             "midpoint_tie_policy": MIDPOINT_TIE_POLICY,
             "distance_relaxed": self.distance_relaxed,
             "priority_nearest_distance_sec": self.priority_nearest_distance_sec,
             "priority_capped_distance_sec": self.priority_capped_distance_sec,
             "status": self.status,
             "duplicate_winner_target_sec": self.duplicate_winner_target_sec,
+            "duplicate_resolution_stage": self.duplicate_resolution_stage,
         }
 
 
@@ -282,6 +284,7 @@ class CanonicalArmResult:
     initial_duplicate_rejection_count: int
     repair_duplicate_rejection_count: int
     distance_relaxation_count: int
+    duplicate_replacement_count: int = 0
 
     def __post_init__(self) -> None:
         if len(self.selected) != FRAME_BUDGET:
@@ -296,6 +299,18 @@ class CanonicalArmResult:
             for left, right in zip(self.selected, self.selected[1:])
         ):
             raise ValueError("selected canonical targets must be strictly increasing")
+        if any(item.status != "selected" for item in self.selected):
+            raise ValueError("every final selected attempt must have status='selected'")
+        selected_attempts = tuple(
+            sorted(
+                (item for item in self.attempts if item.status == "selected"),
+                key=lambda item: item.target_sec,
+            )
+        )
+        if selected_attempts != self.selected:
+            raise ValueError(
+                "final selected attempts must exactly match selected-status provenance"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -306,6 +321,7 @@ class CanonicalArmResult:
             "duplicate_rejection_count": self.duplicate_rejection_count,
             "initial_duplicate_rejection_count": self.initial_duplicate_rejection_count,
             "repair_duplicate_rejection_count": self.repair_duplicate_rejection_count,
+            "duplicate_replacement_count": self.duplicate_replacement_count,
             "distance_relaxation_count": self.distance_relaxation_count,
             "selected_target_timestamps_sec": [
                 item.target_sec for item in self.selected
@@ -341,7 +357,6 @@ class CandidateUnionEntry:
             "pixel_hash": self.pixel_hash,
             "decode_pass_index": self.decode_pass_index,
             "attempted_by": list(self.attempted_by),
-            "decoder_backend": DEFAULT_DECODER_BACKEND,
             "midpoint_tie_policy": MIDPOINT_TIE_POLICY,
         }
 
@@ -454,6 +469,7 @@ class CanonicalDecodeResult:
                 "repair_duplicate_rejection_count": (
                     arm.repair_duplicate_rejection_count
                 ),
+                "duplicate_replacement_count": arm.duplicate_replacement_count,
                 "distance_relaxation_count": arm.distance_relaxation_count,
                 "attempts": [item.to_dict() for item in arm.attempts],
             },
@@ -497,7 +513,7 @@ class CanonicalRequestPair:
 
 @dataclass(frozen=True)
 class CanonicalDecodeBatchResult:
-    """Video-level results sharing one fresh full-lattice decode pass."""
+    """Video-level results sharing primary-union and optional repair passes."""
 
     video_path: str
     decoder_backend: str
@@ -587,10 +603,9 @@ def _decode_batch(
             raise RuntimeError("decoder returned non-monotonic decoded frame indices")
         prior_actual = actual
         prior_frame = frame_index
-        # Full-lattice video batches can contain many thousands of targets.
         # Retain exact provenance and the pixel hash, but discard RGB after
-        # each streaming yield.  Downstream export re-opens only the selected
-        # decoded frame indices, so this avoids a video-length memory spike.
+        # each target. Downstream export re-opens only the selected decoded
+        # frame indices, avoiding a batch-size-dependent memory spike.
         compact_match = DecodedFrameMatch(
             target_timestamp_sec=float(match.target_timestamp_sec),
             actual_pts_sec=actual,
@@ -617,6 +632,7 @@ def _attempt(
     decode_pass_index: int,
     status: str,
     duplicate_winner_target_sec: float | None = None,
+    duplicate_resolution_stage: str | None = None,
 ) -> CanonicalTargetAttempt:
     request = state.request
     target = float(request.lattice_timestamps_sec[canonical_index])
@@ -649,6 +665,7 @@ def _attempt(
         ),
         status=status,
         duplicate_winner_target_sec=duplicate_winner_target_sec,
+        duplicate_resolution_stage=duplicate_resolution_stage,
         rgb=match.rgb,
     )
 
@@ -699,11 +716,83 @@ def _initialize_arm(
             decode_pass_index=pass_index,
             status="selected" if is_winner else "rejected_duplicate",
             duplicate_winner_target_sec=None if is_winner else winner_target,
+            duplicate_resolution_stage=None if is_winner else "initial",
         )
         state.attempts.append(attempt)
         if is_winner:
             state.accepted_by_frame[attempt.decoded_frame_index] = attempt
     return state
+
+
+def _apply_repair_match(
+    state: _ArmState,
+    *,
+    canonical_index: int,
+    distance_relaxed: bool,
+    nearest_distance: float,
+    match: DecodedFrameMatch,
+    decode_pass_index: int,
+) -> None:
+    """Resolve one repair target against the accepted decoded-frame set.
+
+    The frozen collision rule applies at every stage: retain the target with
+    the lexicographically smaller ``(absolute decode error, target time)``.
+    When a repair target wins, the former accepted attempt is explicitly
+    marked as superseded and the accepted mapping is replaced.  The unique
+    frame count therefore stays unchanged and repair continues toward K.
+    """
+
+    request = state.request
+    target = float(request.lattice_timestamps_sec[canonical_index])
+    frame_index = int(match.decoded_frame_index)
+    existing = state.accepted_by_frame.get(frame_index)
+    new_error = abs(float(match.actual_pts_sec) - target)
+    new_wins = existing is not None and (new_error, target) < (
+        existing.abs_error_sec,
+        existing.target_sec,
+    )
+
+    if existing is None or new_wins:
+        status = "selected"
+        duplicate_winner_target_sec = None
+        duplicate_resolution_stage = None
+    else:
+        status = "rejected_duplicate"
+        duplicate_winner_target_sec = existing.target_sec
+        duplicate_resolution_stage = "repair"
+
+    attempt = _attempt(
+        state,
+        canonical_index=canonical_index,
+        target_source=request.candidate_sources[canonical_index],
+        candidate_rank=request.candidate_ranks[canonical_index],
+        stage="repair",
+        repair_round=state.repair_round,
+        distance_relaxed=distance_relaxed,
+        nearest_distance=nearest_distance,
+        match=match,
+        decode_pass_index=decode_pass_index,
+        status=status,
+        duplicate_winner_target_sec=duplicate_winner_target_sec,
+        duplicate_resolution_stage=duplicate_resolution_stage,
+    )
+
+    if new_wins:
+        for index, prior in enumerate(state.attempts):
+            if prior is existing:
+                state.attempts[index] = replace(
+                    existing,
+                    status="replaced_by_lower_error",
+                    duplicate_winner_target_sec=target,
+                    duplicate_resolution_stage="repair",
+                )
+                break
+        else:  # pragma: no cover - internal accepted/attempt invariant
+            raise RuntimeError("accepted attempt is missing from provenance")
+
+    state.attempts.append(attempt)
+    if existing is None or new_wins:
+        state.accepted_by_frame[frame_index] = attempt
 
 
 def _next_repair_candidate(state: _ArmState) -> tuple[int, bool, float] | None:
@@ -769,64 +858,6 @@ def _failure_provenance(
     }
 
 
-def _finish_states_from_cache(
-    states: Sequence[_ArmState],
-    cache: Mapping[float, tuple[DecodedFrameMatch, int]],
-    *,
-    video_path: str | Path,
-    decoder_backend: str,
-    decode_passes: Sequence[DecodePass],
-) -> None:
-    """Complete collision repair when every lattice tick is already decoded."""
-
-    while any(len(state.accepted_by_frame) < FRAME_BUDGET for state in states):
-        for state in states:
-            if len(state.accepted_by_frame) >= FRAME_BUDGET:
-                continue
-            choice = _next_repair_candidate(state)
-            if choice is None:
-                raise CanonicalDecodeExhaustedError(
-                    state.request.method,
-                    _failure_provenance(
-                        state,
-                        video_path=video_path,
-                        decoder_backend=decoder_backend,
-                        decode_passes=decode_passes,
-                    ),
-                )
-            canonical_index, relaxed, nearest_distance = choice
-            state.attempted_canonical_indices.add(canonical_index)
-            state.repair_round += 1
-            if relaxed:
-                state.distance_relaxation_count += 1
-            request = state.request
-            target = request.lattice_timestamps_sec[canonical_index]
-            try:
-                match, pass_index = cache[target]
-            except KeyError as exc:  # pragma: no cover - internal batch invariant
-                raise RuntimeError("full-lattice decode cache is incomplete") from exc
-            existing = state.accepted_by_frame.get(int(match.decoded_frame_index))
-            attempt = _attempt(
-                state,
-                canonical_index=canonical_index,
-                target_source=request.candidate_sources[canonical_index],
-                candidate_rank=request.candidate_ranks[canonical_index],
-                stage="repair",
-                repair_round=state.repair_round,
-                distance_relaxed=relaxed,
-                nearest_distance=nearest_distance,
-                match=match,
-                decode_pass_index=pass_index,
-                status="selected" if existing is None else "rejected_duplicate",
-                duplicate_winner_target_sec=(
-                    None if existing is None else existing.target_sec
-                ),
-            )
-            state.attempts.append(attempt)
-            if existing is None:
-                state.accepted_by_frame[attempt.decoded_frame_index] = attempt
-
-
 def _build_decode_result(
     states: Sequence[_ArmState],
     cache: Mapping[float, tuple[DecodedFrameMatch, int]],
@@ -840,13 +871,22 @@ def _build_decode_result(
         selected = tuple(
             sorted(state.accepted_by_frame.values(), key=lambda item: item.target_sec)
         )
+        # These historical field names count collision *losses*, including an
+        # earlier accepted target later superseded by a lower-error repair.
+        # Resolution stage records when the collision was decided, rather than
+        # the original primary/repair stage of the losing attempt.
         initial_rejections = sum(
-            attempt.stage == "primary" and attempt.status == "rejected_duplicate"
+            attempt.duplicate_resolution_stage == "initial"
+            and attempt.status in _DUPLICATE_LOSS_STATUSES
             for attempt in state.attempts
         )
         repair_rejections = sum(
-            attempt.stage == "repair" and attempt.status == "rejected_duplicate"
+            attempt.duplicate_resolution_stage == "repair"
+            and attempt.status in _DUPLICATE_LOSS_STATUSES
             for attempt in state.attempts
+        )
+        replacements = sum(
+            attempt.status == "replaced_by_lower_error" for attempt in state.attempts
         )
         repair_attempts = sum(attempt.stage == "repair" for attempt in state.attempts)
         arm_results[state.request.method] = CanonicalArmResult(
@@ -859,6 +899,7 @@ def _build_decode_result(
             initial_duplicate_rejection_count=initial_rejections,
             repair_duplicate_rejection_count=repair_rejections,
             distance_relaxation_count=state.distance_relaxation_count,
+            duplicate_replacement_count=replacements,
         )
 
     attempted_targets = sorted(
@@ -991,27 +1032,14 @@ def decode_canonical_targets(
             request = state.request
             target = request.lattice_timestamps_sec[canonical_index]
             match, pass_index = cache[target]
-            existing = state.accepted_by_frame.get(int(match.decoded_frame_index))
-            status = "selected" if existing is None else "rejected_duplicate"
-            attempt = _attempt(
+            _apply_repair_match(
                 state,
                 canonical_index=canonical_index,
-                target_source=request.candidate_sources[canonical_index],
-                candidate_rank=request.candidate_ranks[canonical_index],
-                stage="repair",
-                repair_round=state.repair_round,
                 distance_relaxed=relaxed,
                 nearest_distance=nearest_distance,
                 match=match,
                 decode_pass_index=pass_index,
-                status=status,
-                duplicate_winner_target_sec=(
-                    None if existing is None else existing.target_sec
-                ),
             )
-            state.attempts.append(attempt)
-            if existing is None:
-                state.accepted_by_frame[attempt.decoded_frame_index] = attempt
 
     return _build_decode_result(
         states,
@@ -1030,14 +1058,14 @@ def decode_canonical_request_batch(
     decoder: Decoder | None = None,
     decoder_backend: str = DEFAULT_DECODER_BACKEND,
 ) -> CanonicalDecodeBatchResult:
-    """Serve every item/origin request for one video with one fresh pass.
+    """Serve item/origin requests with video-level unioned decode passes.
 
-    The union contains each request's *full canonical lattice*, rather than
-    scout PTS or scout frame indices.  Consequently every possible repair
-    target is already backed by a fresh source-video nearest-PTS match, and the
-    dynamic repair loop performs no additional video decodes.  Default PyAV
-    decoding is consumed as a stream and RGB arrays are discarded immediately
-    after their hashes/provenance have been retained.
+    Pass one contains only the union of all primary canonical targets.  If a
+    decoded-frame collision leaves an arm below K, every unfinished arm chooses
+    one dynamic backup against its current accepted targets and those backups
+    are unioned into the next pass.  Thus the usual no-repair case is exactly
+    one source-video pass without decoding or RGB-hashing unused lattice ticks.
+    No scout PTS or scout frame index enters this function.
     """
 
     if isinstance(requests, (str, bytes)):
@@ -1055,6 +1083,11 @@ def decode_canonical_request_batch(
     request_ids = tuple(pair.request_id for pair in pairs)
     if len(set(request_ids)) != len(request_ids):
         raise ValueError("request_id values must be unique within one video batch")
+    reference_lattice = pairs[0].rc12.lattice_timestamps_sec
+    if any(pair.rc12.lattice_timestamps_sec != reference_lattice for pair in pairs):
+        raise ValueError(
+            "every request for one video must use the exact same canonical lattice"
+        )
     if isinstance(stream_index, bool) or not isinstance(stream_index, Integral):
         raise TypeError("stream_index must be an integer")
     if int(stream_index) < 0:
@@ -1062,48 +1095,97 @@ def decode_canonical_request_batch(
     if not isinstance(decoder_backend, str) or not decoder_backend.strip():
         raise ValueError("decoder_backend must be a non-empty string")
 
-    full_lattice_union = sorted(
-        {target for pair in pairs for target in pair.rc12.lattice_timestamps_sec}
+    primary_union = sorted(
+        {target for pair in pairs for target in pair.rc12.primary_target_timestamps_sec}
         | {
             target
             for pair in pairs
-            for target in pair.canonical_uniform.lattice_timestamps_sec
+            for target in pair.canonical_uniform.primary_target_timestamps_sec
         }
     )
-    cache, decode_pass = _decode_batch(
+    cache, first_pass = _decode_batch(
         video_path,
-        full_lattice_union,
+        primary_union,
         stream_index=int(stream_index),
         decoder=decoder,
         pass_index=1,
     )
-    decode_passes = (decode_pass,)
-    results: dict[str, CanonicalDecodeResult] = {}
+    decode_passes = [first_pass]
+    states_by_request: dict[str, list[_ArmState]] = {}
     for pair in pairs:
-        states = [
+        states_by_request[pair.request_id] = [
             _initialize_arm(pair.rc12, cache),
             _initialize_arm(pair.canonical_uniform, cache),
         ]
-        _finish_states_from_cache(
-            states,
-            cache,
-            video_path=video_path,
-            decoder_backend=decoder_backend,
-            decode_passes=decode_passes,
-        )
+
+    all_states = [state for states in states_by_request.values() for state in states]
+    while any(len(state.accepted_by_frame) < FRAME_BUDGET for state in all_states):
+        pending: list[tuple[_ArmState, int, bool, float]] = []
+        new_targets: list[float] = []
+        for state in all_states:
+            if len(state.accepted_by_frame) >= FRAME_BUDGET:
+                continue
+            choice = _next_repair_candidate(state)
+            if choice is None:
+                raise CanonicalDecodeExhaustedError(
+                    state.request.method,
+                    _failure_provenance(
+                        state,
+                        video_path=video_path,
+                        decoder_backend=decoder_backend,
+                        decode_passes=decode_passes,
+                    ),
+                )
+            canonical_index, relaxed, nearest_distance = choice
+            state.attempted_canonical_indices.add(canonical_index)
+            state.repair_round += 1
+            if relaxed:
+                state.distance_relaxation_count += 1
+            pending.append((state, canonical_index, relaxed, nearest_distance))
+            target = state.request.lattice_timestamps_sec[canonical_index]
+            if target not in cache:
+                new_targets.append(target)
+
+        if new_targets:
+            decoded, decode_pass = _decode_batch(
+                video_path,
+                new_targets,
+                stream_index=int(stream_index),
+                decoder=decoder,
+                pass_index=len(decode_passes) + 1,
+            )
+            cache.update(decoded)
+            decode_passes.append(decode_pass)
+
+        for state, canonical_index, relaxed, nearest_distance in pending:
+            request = state.request
+            target = request.lattice_timestamps_sec[canonical_index]
+            match, pass_index = cache[target]
+            _apply_repair_match(
+                state,
+                canonical_index=canonical_index,
+                distance_relaxed=relaxed,
+                nearest_distance=nearest_distance,
+                match=match,
+                decode_pass_index=pass_index,
+            )
+
+    results: dict[str, CanonicalDecodeResult] = {}
+    frozen_passes = tuple(decode_passes)
+    for pair in pairs:
         results[pair.request_id] = _build_decode_result(
-            states,
+            states_by_request[pair.request_id],
             cache,
             video_path=video_path,
             decoder_backend=decoder_backend,
-            decode_passes=decode_passes,
+            decode_passes=frozen_passes,
         )
 
     return CanonicalDecodeBatchResult(
         video_path=str(Path(video_path)),
         decoder_backend=decoder_backend,
         midpoint_tie_policy=MIDPOINT_TIE_POLICY,
-        decode_passes=decode_passes,
+        decode_passes=frozen_passes,
         request_results=results,
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 import types
@@ -10,14 +11,15 @@ import av
 import numpy as np
 import pytest
 import torch
+from phase_stable.canonical_resample import (
+    CanonicalArmRequest,
+    decode_canonical_targets,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODIFIED_ROOT = REPO_ROOT / "lmms-eval-diff" / "modified_files" / "lmms_eval"
 HELPER = (
-    MODIFIED_ROOT
-    / "models"
-    / "model_utils"
-    / "qwen2_5_vl_keyframe_vision_process.py"
+    MODIFIED_ROOT / "models" / "model_utils" / "qwen2_5_vl_keyframe_vision_process.py"
 )
 PATCH = REPO_ROOT / "lmms-eval-diff" / "lmms_eval_wfs.patch"
 
@@ -25,7 +27,12 @@ PATCH = REPO_ROOT / "lmms-eval-diff" / "lmms_eval_wfs.patch"
 def _load_helper(monkeypatch: pytest.MonkeyPatch):
     package = types.ModuleType("qwen_vl_utils")
     vision_process = types.ModuleType("qwen_vl_utils.vision_process")
-    for name in ("ceil_by_factor", "extract_vision_info", "fetch_image", "smart_resize"):
+    for name in (
+        "ceil_by_factor",
+        "extract_vision_info",
+        "fetch_image",
+        "smart_resize",
+    ):
         setattr(vision_process, name, lambda *args, **kwargs: None)
     package.vision_process = vision_process
     monkeypatch.setitem(sys.modules, "qwen_vl_utils", package)
@@ -63,11 +70,13 @@ def test_pyav_helper_returns_exact_requested_frames(
     _write_video(video_path)
 
     with av.open(str(video_path)) as container:
-        decoded = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+        decoded = [
+            frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)
+        ]
     requested = [3, 0, 3]
-    expected = torch.from_numpy(np.stack([decoded[index] for index in requested])).permute(
-        0, 3, 1, 2
-    )
+    expected = torch.from_numpy(
+        np.stack([decoded[index] for index in requested])
+    ).permute(0, 3, 1, 2)
 
     video, metadata, sample_fps = module._read_video_pyav_keyframe(
         {"video": str(video_path)}, requested
@@ -91,6 +100,53 @@ def test_pyav_helper_rejects_out_of_range_index(
 
     with pytest.raises(IndexError, match="missing=\\[5\\], total_num_frames=5"):
         module._read_video_pyav_keyframe({"video": str(video_path)}, [5])
+
+
+def test_exact_canonical_trace_indices_roundtrip_to_qwen_pixel_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact selector and deployed Qwen loader share one frame index space."""
+
+    module = _load_helper(monkeypatch)
+    video_path = tmp_path / "roundtrip.mp4"
+    _write_video(video_path, frame_count=24)
+    lattice = tuple(index / 5.0 for index in range(24))
+    primary = lattice[:16]
+
+    def arm(method: str, role: str) -> CanonicalArmRequest:
+        return CanonicalArmRequest(
+            method=method,
+            role=role,
+            primary_target_timestamps_sec=primary,
+            lattice_timestamps_sec=lattice,
+            candidate_scores=(0.0,) * len(lattice),
+        )
+
+    decoded = decode_canonical_targets(
+        video_path,
+        rc12=arm("phasefuse_rc12", "rc12"),
+        canonical_uniform=arm("canonical_uniform", "canonical_uniform"),
+    )
+    trace = decoded.trace_row(
+        "phasefuse_rc12",
+        dataset="videomme",
+        video_id="roundtrip",
+        question_id="q1",
+        origin_id=0,
+        origin_sec=0.0,
+    )
+    video, _, _ = module._read_video_pyav_keyframe(
+        {"video": str(video_path)}, trace["selected_source_frame_indices"]
+    )
+    loaded_hashes = [
+        hashlib.sha256(
+            memoryview(np.ascontiguousarray(frame.permute(1, 2, 0).cpu().numpy())).cast(
+                "B"
+            )
+        ).hexdigest()
+        for frame in video
+    ]
+    assert loaded_hashes == trace["selected_pixel_hashes"]
 
 
 def test_pyav_helper_supports_frames_without_duration(
@@ -156,7 +212,7 @@ def test_qwen_paths_preserve_keyframes_without_decord_resampling() -> None:
         assert "if video_inputs is not None and not self.use_keyframe" in source
     assert "import decord" not in simple
     assert "from decord" not in protocol
-    assert 'video_kwargs = {}' in HELPER.read_text(encoding="utf-8")
+    assert "video_kwargs = {}" in HELPER.read_text(encoding="utf-8")
     assert "do_sample_frames" not in HELPER.read_text(encoding="utf-8")
 
 

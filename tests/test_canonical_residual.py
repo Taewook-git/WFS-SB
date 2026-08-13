@@ -5,6 +5,7 @@ from phase_stable.canonical_residual import (
     RC12Config,
     canonical_lattice,
     percentile_rank,
+    select_canonical_uniform_targets,
     select_rc12_targets,
 )
 
@@ -116,3 +117,16 @@ def test_decisions_are_canonical_targets_not_scout_frame_indices():
     assert np.all(second.target_timestamps_sec % 0.5 == 0.0)
     assert not np.shares_memory(first.target_timestamps_sec, base_times)
     assert not np.shares_memory(second.target_timestamps_sec, shifted_times)
+
+
+def test_canonical_uniform_returns_full_lattice_and_exact_target_indices():
+    scout = np.arange(0.0, 40.0, 0.25)
+    lattice, selected = select_canonical_uniform_targets(
+        scout,
+        support_start_sec=1.0,
+        support_stop_sec=38.0,
+    )
+    assert selected.shape == (16,)
+    assert np.all(np.diff(selected) > 0)
+    assert lattice.size > selected.size
+    assert np.all(lattice % 0.5 == 0.0)
