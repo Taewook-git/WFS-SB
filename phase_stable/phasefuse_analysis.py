@@ -28,7 +28,31 @@ from .policy import FIDELITY_METRICS, qvhighlights_selection_fidelity
 ItemKey = tuple[str, str, str]
 TraceKey = tuple[str, str, str, int]
 
-_CONSISTENCY_METRICS = (
+_TIMESTAMP_F1_TOLERANCES = (
+    ("0p25s", 0.25),
+    ("0p5s", 0.5),
+    ("1s", 1.0),
+)
+_PRIMARY_TIMESTAMP_F1_METRIC = "selected_timestamp_f1_at_0p5s_mean"
+_PRIMARY_OUTER_UNCERTAINTY_METRIC = "outer_origin_selector_uncertainty"
+
+# Timestamp agreement on decoded-frame PTS is the primary selector-stability
+# family.  Exact source-frame identity remains useful as a stricter, secondary
+# diagnostic, and the two unsuffixed timestamp fields are retained as aliases
+# of the historical 1.0-second metric for output-schema compatibility.
+_PRIMARY_CONSISTENCY_METRICS = tuple(
+    f"selected_timestamp_f1_at_{label}_{summary}"
+    for label, _ in _TIMESTAMP_F1_TOLERANCES
+    for summary in ("mean", "worst")
+) + (_PRIMARY_OUTER_UNCERTAINTY_METRIC,)
+_SECONDARY_EXACT_SOURCE_METRICS = (
+    "selected_set_consistency",
+    "selected_set_jaccard_worst",
+    "selected_set_overlap_mean",
+    "selected_all_origin_intersection_fraction",
+    "outer_origin_selected_set_uncertainty",
+)
+_LEGACY_CONSISTENCY_METRICS = (
     "selected_set_consistency",
     "selected_set_jaccard_worst",
     "selected_set_overlap_mean",
@@ -36,6 +60,10 @@ _CONSISTENCY_METRICS = (
     "selected_timestamp_f1_mean",
     "selected_timestamp_f1_worst",
     "outer_origin_selected_set_uncertainty",
+)
+_CONSISTENCY_METRICS = (
+    *_LEGACY_CONSISTENCY_METRICS,
+    *_PRIMARY_CONSISTENCY_METRICS,
 )
 
 _INNER_PHASE_FIELDS = (
@@ -270,7 +298,7 @@ def _trace_item_metrics(grid: _TraceGrid) -> list[dict[str, Any]]:
         ]
         jaccards: list[float] = []
         overlaps: list[float] = []
-        timestamp_f1: list[float] = []
+        timestamp_f1 = {label: [] for label, _ in _TIMESTAMP_F1_TOLERANCES}
         for left, right in combinations(range(len(traces)), 2):
             intersection = len(selections[left] & selections[right])
             union = len(selections[left] | selections[right])
@@ -278,15 +306,24 @@ def _trace_item_metrics(grid: _TraceGrid) -> list[dict[str, Any]]:
             overlaps.append(
                 float(intersection / min(len(selections[left]), len(selections[right])))
             )
-            timestamp_f1.append(
-                float(
-                    selected_timestamp_metrics(
-                        selected_times[left], selected_times[right], tolerance=1.0
-                    )["f1"]
+            for label, tolerance in _TIMESTAMP_F1_TOLERANCES:
+                timestamp_f1[label].append(
+                    float(
+                        selected_timestamp_metrics(
+                            selected_times[left],
+                            selected_times[right],
+                            tolerance=tolerance,
+                        )["f1"]
+                    )
                 )
-            )
         common = set(selections[0]).intersection(*selections[1:])
         consistency = float(np.mean(jaccards))
+        timestamp_metrics = {
+            f"selected_timestamp_f1_at_{label}_{summary}": float(reducer(values))
+            for label, values in timestamp_f1.items()
+            for summary, reducer in (("mean", np.mean), ("worst", np.min))
+        }
+        primary_timestamp_consistency = timestamp_metrics[_PRIMARY_TIMESTAMP_F1_METRIC]
         rows.append(
             {
                 "dataset": item[0],
@@ -301,17 +338,110 @@ def _trace_item_metrics(grid: _TraceGrid) -> list[dict[str, Any]]:
                 "selected_all_origin_intersection_fraction": float(
                     len(common) / grid.frame_budget
                 ),
-                "selected_timestamp_f1_mean": float(np.mean(timestamp_f1)),
-                "selected_timestamp_f1_worst": float(np.min(timestamp_f1)),
+                **timestamp_metrics,
+                "outer_origin_selector_uncertainty": float(
+                    1.0 - primary_timestamp_consistency
+                ),
+                # Backward-compatible aliases for the original 1.0-second
+                # timestamp-F1 fields.
+                "selected_timestamp_f1_mean": timestamp_metrics[
+                    "selected_timestamp_f1_at_1s_mean"
+                ],
+                "selected_timestamp_f1_worst": timestamp_metrics[
+                    "selected_timestamp_f1_at_1s_worst"
+                ],
                 "outer_origin_selected_set_uncertainty": float(1.0 - consistency),
             }
         )
     return rows
 
 
+def _single_phase_unavailability_reason(grid: _TraceGrid) -> str | None:
+    """Identify selectors for which inner-phase disagreement is undefined."""
+
+    if grid.method == "dense_swt":
+        return "dense_swt is a direct single-stream selector (num_phases=1)"
+
+    declared_phase_counts: set[int] = set()
+    selector_labels: set[str] = set()
+    for item in grid.item_keys:
+        for origin in grid.origin_ids:
+            row = grid.rows[item][origin]
+            metadata = row.get("method_metadata")
+            if metadata is not None and not isinstance(metadata, Mapping):
+                raise TypeError("method_metadata must be a mapping when supplied")
+
+            phasefuse_metadata: Mapping[str, Any] | None = None
+            phasefuse_config: Mapping[str, Any] | None = None
+            if isinstance(metadata, Mapping):
+                raw_phasefuse = metadata.get("phasefuse")
+                if raw_phasefuse is not None and not isinstance(raw_phasefuse, Mapping):
+                    raise TypeError("method_metadata.phasefuse must be a mapping")
+                if isinstance(raw_phasefuse, Mapping):
+                    phasefuse_metadata = raw_phasefuse
+                    raw_config = raw_phasefuse.get("config")
+                    if raw_config is not None and not isinstance(raw_config, Mapping):
+                        raise TypeError(
+                            "method_metadata.phasefuse.config must be a mapping"
+                        )
+                    if isinstance(raw_config, Mapping):
+                        phasefuse_config = raw_config
+
+            phase_values = [
+                row.get("num_phases"),
+                None if metadata is None else metadata.get("num_phases"),
+                (
+                    None
+                    if phasefuse_metadata is None
+                    else phasefuse_metadata.get("num_phases")
+                ),
+                (
+                    None
+                    if phasefuse_config is None
+                    else phasefuse_config.get("num_phases")
+                ),
+            ]
+            row_counts: set[int] = set()
+            for value in phase_values:
+                if value is None:
+                    continue
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Integral)
+                    or int(value) < 1
+                ):
+                    raise ValueError(
+                        "trace metadata num_phases must be a positive integer"
+                    )
+                row_counts.add(int(value))
+            if len(row_counts) > 1:
+                raise ValueError("trace row has conflicting num_phases metadata")
+            declared_phase_counts.update(row_counts)
+
+            selector_values = [
+                row.get("selector"),
+                row.get("selector_kind"),
+                None if metadata is None else metadata.get("selector"),
+                None if metadata is None else metadata.get("selector_kind"),
+            ]
+            selector_labels.update(
+                str(value).strip().lower()
+                for value in selector_values
+                if isinstance(value, str) and value.strip()
+            )
+
+    if len(declared_phase_counts) > 1:
+        raise ValueError(f"method {grid.method!r} mixes num_phases metadata")
+    if declared_phase_counts and next(iter(declared_phase_counts)) < 2:
+        return "trace metadata declares num_phases<2, so inner-phase uncertainty is undefined"
+    if selector_labels & {"dense_swt", "direct_dense_single_stream"}:
+        return "trace metadata identifies a direct single-stream selector"
+    return None
+
+
 def _optional_inner_phase_rows(
     grid: _TraceGrid,
-) -> tuple[list[dict[str, Any]] | None, tuple[str, ...]]:
+) -> tuple[list[dict[str, Any]] | None, tuple[str, ...], str | None]:
     """Read optional raw inner-phase uncertainty without conflating origins.
 
     Each available scalar is averaged over outer origins to form one value per
@@ -319,6 +449,10 @@ def _optional_inner_phase_rows(
     none of them; partial artifacts are evidence of an interrupted or mixed
     run and are rejected.
     """
+
+    single_phase_reason = _single_phase_unavailability_reason(grid)
+    if single_phase_reason is not None:
+        return None, (), single_phase_reason
 
     flat_rows = [
         grid.rows[item][origin] for item in grid.item_keys for origin in grid.origin_ids
@@ -340,7 +474,11 @@ def _optional_inner_phase_rows(
                 f"method {grid.method!r} provides inner-phase companion fields "
                 f"without {primary!r}"
             )
-        return None, ()
+        return (
+            None,
+            (),
+            ("selected_phase_uncertainty_mean is absent from every trace row"),
+        )
 
     result: list[dict[str, Any]] = []
     for item in grid.item_keys:
@@ -374,7 +512,7 @@ def _optional_inner_phase_rows(
                 },
             }
         )
-    return result, tuple(available_fields)
+    return result, tuple(available_fields), None
 
 
 def selected_set_consistency(
@@ -545,10 +683,22 @@ def _method_summary(
         },
     }
     if calibrated:
+        failure = [float(row["qv_evidence_loss"]) for row in rows]
+        summary["outer_origin_selector_failure_calibration"] = (
+            phase_uncertainty_failure_calibration(
+                [float(row[_PRIMARY_OUTER_UNCERTAINTY_METRIC]) for row in rows],
+                failure,
+            )
+        )
+        summary["outer_origin_selector_failure_calibration"]["failure_definition"] = (
+            "1 - mean selected_relevant_fraction across origins"
+        )
+        # Preserve the exact-source calibration block used by schema v1 as a
+        # secondary diagnostic.
         summary["outer_origin_selected_set_failure_calibration"] = (
             phase_uncertainty_failure_calibration(
                 [float(row["outer_origin_selected_set_uncertainty"]) for row in rows],
-                [float(row["qv_evidence_loss"]) for row in rows],
+                failure,
             )
         )
         summary["outer_origin_selected_set_failure_calibration"][
@@ -575,11 +725,13 @@ def _inner_method_block(
     fields: Sequence[str],
     *,
     failure_rows: Sequence[Mapping[str, Any]] | None,
+    unavailable_reason: str | None = None,
 ) -> dict[str, Any]:
     if rows is None:
         return {
             "status": "unavailable",
-            "reason": "selected_phase_uncertainty_mean is absent from every trace row",
+            "reason": unavailable_reason
+            or "selected_phase_uncertainty_mean is absent from every trace row",
             "available_fields": [],
         }
     block: dict[str, Any] = {
@@ -786,8 +938,16 @@ def evaluate_phasefuse_analysis(
     _align_trace_grids(baseline, treatment)
     baseline_rows = _trace_item_metrics(baseline)
     treatment_rows = _trace_item_metrics(treatment)
-    baseline_inner_rows, baseline_inner_fields = _optional_inner_phase_rows(baseline)
-    treatment_inner_rows, treatment_inner_fields = _optional_inner_phase_rows(treatment)
+    (
+        baseline_inner_rows,
+        baseline_inner_fields,
+        baseline_inner_unavailable_reason,
+    ) = _optional_inner_phase_rows(baseline)
+    (
+        treatment_inner_rows,
+        treatment_inner_fields,
+        treatment_inner_unavailable_reason,
+    ) = _optional_inner_phase_rows(treatment)
 
     metric_names = list(_CONSISTENCY_METRICS)
     calibrated = qv_records is not None
@@ -806,7 +966,10 @@ def evaluate_phasefuse_analysis(
         [[float(row[name]) for name in metric_names] for row in treatment_rows],
         dtype=float,
     )
-    uncertainty_index = metric_names.index("outer_origin_selected_set_uncertainty")
+    uncertainty_index = metric_names.index(_PRIMARY_OUTER_UNCERTAINTY_METRIC)
+    legacy_uncertainty_index = metric_names.index(
+        "outer_origin_selected_set_uncertainty"
+    )
     if calibrated:
         failure_index = metric_names.index("qv_evidence_loss")
 
@@ -820,11 +983,22 @@ def evaluate_phasefuse_analysis(
         second_calibration = phase_uncertainty_failure_calibration(
             second[:, uncertainty_index], second[:, failure_index]
         )
+        first_legacy_calibration = phase_uncertainty_failure_calibration(
+            first[:, legacy_uncertainty_index], first[:, failure_index]
+        )
+        second_legacy_calibration = phase_uncertainty_failure_calibration(
+            second[:, legacy_uncertainty_index], second[:, failure_index]
+        )
         calibration_effect = np.asarray(
             [
                 second_calibration["aurc"] - first_calibration["aurc"],
                 second_calibration["excess_aurc"] - first_calibration["excess_aurc"],
                 second_calibration["brier_score"] - first_calibration["brier_score"],
+                second_legacy_calibration["aurc"] - first_legacy_calibration["aurc"],
+                second_legacy_calibration["excess_aurc"]
+                - first_legacy_calibration["excess_aurc"],
+                second_legacy_calibration["brier_score"]
+                - first_legacy_calibration["brier_score"],
             ],
             dtype=float,
         )
@@ -844,6 +1018,9 @@ def evaluate_phasefuse_analysis(
     if calibrated:
         effect_order.extend(
             (
+                "delta_outer_origin_selector_failure_aurc",
+                "delta_outer_origin_selector_failure_excess_aurc",
+                "delta_outer_origin_selector_failure_brier",
                 "delta_outer_origin_selected_set_failure_aurc",
                 "delta_outer_origin_selected_set_failure_excess_aurc",
                 "delta_outer_origin_selected_set_failure_brier",
@@ -860,15 +1037,52 @@ def evaluate_phasefuse_analysis(
         "origin_ids": list(baseline.origin_ids),
         "frame_budget": baseline.frame_budget,
         "cluster_unit": "dataset/video_id",
+        "selector_stability": {
+            "primary": {
+                "family": "pairwise tolerant timestamp F1",
+                "timestamp_field": "selected_actual_pts_sec",
+                "reported_tolerances_sec": [
+                    tolerance for _, tolerance in _TIMESTAMP_F1_TOLERANCES
+                ],
+                "reference_tolerance_sec": 0.5,
+                "reference_metric": _PRIMARY_TIMESTAMP_F1_METRIC,
+                "uncertainty_metric": _PRIMARY_OUTER_UNCERTAINTY_METRIC,
+            },
+            "secondary": {
+                "family": "exact source-frame identity",
+                "reference_metric": "selected_set_consistency",
+                "uncertainty_metric": "outer_origin_selected_set_uncertainty",
+            },
+            "legacy_aliases": {
+                "selected_timestamp_f1_mean": ("selected_timestamp_f1_at_1s_mean"),
+                "selected_timestamp_f1_worst": ("selected_timestamp_f1_at_1s_worst"),
+            },
+        },
         "selected_set_definition": (
-            "mean pairwise Jaccard of unique selected_source_frame_indices"
+            "secondary: mean pairwise Jaccard of unique selected_source_frame_indices"
         ),
-        "selected_timestamp_definition": "pairwise F1 at 1.0 second tolerance",
+        "selected_timestamp_definition": (
+            "primary: pairwise tolerant F1 of selected_actual_pts_sec at "
+            "0.25, 0.5, and 1.0 seconds; 0.5 seconds is the reference tolerance"
+        ),
+        "outer_origin_selector_uncertainty_definition": (
+            "1 - mean pairwise selected_actual_pts_sec F1 at 0.5-second tolerance"
+        ),
         "outer_origin_selected_set_uncertainty_definition": (
-            "1 - mean pairwise Jaccard across outer-origin selected source-frame sets"
+            "secondary: 1 - mean pairwise Jaccard across outer-origin selected "
+            "source-frame sets"
         ),
         "metric_directions": {
-            **{name: "higher_is_better" for name in _CONSISTENCY_METRICS[:-1]},
+            **{
+                name: "higher_is_better"
+                for name in _CONSISTENCY_METRICS
+                if name
+                not in {
+                    _PRIMARY_OUTER_UNCERTAINTY_METRIC,
+                    "outer_origin_selected_set_uncertainty",
+                }
+            },
+            _PRIMARY_OUTER_UNCERTAINTY_METRIC: "lower_is_better",
             "outer_origin_selected_set_uncertainty": "lower_is_better",
             **(
                 {
@@ -879,6 +1093,9 @@ def evaluate_phasefuse_analysis(
                     "mean_gt_clip_nearest_selected_sec": "lower_is_better",
                     "qv_evidence_loss": "lower_is_better",
                     "qv_zero_relevant_origin_rate": "lower_is_better",
+                    "outer_origin_selector_failure_aurc": "lower_is_better",
+                    "outer_origin_selector_failure_excess_aurc": "lower_is_better",
+                    "outer_origin_selector_failure_brier": "lower_is_better",
                     "outer_origin_selected_set_failure_aurc": "lower_is_better",
                     "outer_origin_selected_set_failure_excess_aurc": (
                         "lower_is_better"
@@ -910,11 +1127,13 @@ def evaluate_phasefuse_analysis(
                     baseline_inner_rows,
                     baseline_inner_fields,
                     failure_rows=baseline_rows if calibrated else None,
+                    unavailable_reason=baseline_inner_unavailable_reason,
                 ),
                 treatment_method: _inner_method_block(
                     treatment_inner_rows,
                     treatment_inner_fields,
                     failure_rows=treatment_rows if calibrated else None,
+                    unavailable_reason=treatment_inner_unavailable_reason,
                 ),
             },
             "comparison": _inner_phase_comparison(
@@ -1098,9 +1317,7 @@ def categorize_prediction_stability(
                 for category, count in counts.items()
             },
             "mean_accuracy": float(np.mean([row["mean_accuracy"] for row in group])),
-            "mllm_stability_metrics": mllm_stability_metrics(
-                prediction_matrix, gold
-            ),
+            "mllm_stability_metrics": mllm_stability_metrics(prediction_matrix, gold),
         }
     return _jsonable(
         {
@@ -1204,6 +1421,7 @@ def evaluate_prediction_failure_calibration(
         (row["method"], row["dataset"], row["video_id"], row["question_id"]): row
         for row in categories["item_rows"]
     }
+    outer_primary_calibrations: dict[str, Any] = {}
     outer_calibrations: dict[str, Any] = {}
     inner_blocks: dict[str, Any] = {}
     for method in methods:
@@ -1222,15 +1440,30 @@ def evaluate_prediction_failure_calibration(
             )
             for row in metrics
         ]
+        primary_calibration = phase_uncertainty_failure_calibration(
+            [float(row[_PRIMARY_OUTER_UNCERTAINTY_METRIC]) for row in metrics],
+            failure,
+        )
+        primary_calibration["failure_definition"] = (
+            "fraction of origins answered incorrectly"
+        )
+        outer_primary_calibrations[method] = primary_calibration
         calibration = phase_uncertainty_failure_calibration(
             [float(row["outer_origin_selected_set_uncertainty"]) for row in metrics],
             failure,
         )
         calibration["failure_definition"] = "fraction of origins answered incorrectly"
         outer_calibrations[method] = calibration
-        inner_rows, inner_fields = _optional_inner_phase_rows(trace_grid)
+        inner_rows, inner_fields, inner_unavailable_reason = _optional_inner_phase_rows(
+            trace_grid
+        )
         if inner_rows is None:
-            inner_blocks[method] = _inner_method_block(None, (), failure_rows=None)
+            inner_blocks[method] = _inner_method_block(
+                None,
+                (),
+                failure_rows=None,
+                unavailable_reason=inner_unavailable_reason,
+            )
         else:
             inner_block = _inner_method_block(
                 inner_rows, inner_fields, failure_rows=None
@@ -1258,6 +1491,8 @@ def evaluate_prediction_failure_calibration(
         {
             "cluster_key": "dataset/video_id",
             "categories": categories,
+            "outer_origin_selector_failure_calibration": (outer_primary_calibrations),
+            # Schema-v1 compatibility: exact-source Jaccard uncertainty.
             "outer_origin_selected_set_failure_calibration": outer_calibrations,
             "inner_phase_uncertainty": {
                 "definition": (

@@ -15,9 +15,11 @@ from phase_stable.multiphase import (
 )
 from phase_stable.phasefuse_analysis import evaluate_phasefuse_analysis
 from phase_stable.phasefuse_experiment import (
+    PHASEFUSE_DEFAULT_METHODS,
     PHASEFUSE_METHODS,
     PhaseFuseExperimentConfig,
     config_from_mapping,
+    load_phasefuse_config,
     run_phasefuse_experiment,
     run_phasefuse_method,
 )
@@ -75,7 +77,10 @@ def test_all_phasefuse_arms_share_candidates_and_emit_exact_source_budget(
     config = PhaseFuseExperimentConfig(frame_budget=8, min_frames_per_segment=2)
     rows = run_phasefuse_experiment(records, tmp_path / "run", config=config)
 
-    assert len(rows) == len(records) * len(PHASEFUSE_METHODS)
+    assert "phasefuse_v2" in PHASEFUSE_METHODS
+    assert config.methods == PHASEFUSE_DEFAULT_METHODS
+    assert "phasefuse_v2" not in config.methods
+    assert len(rows) == len(records) * len(config.methods)
     assert list(iter_jsonl(tmp_path / "run" / "traces.jsonl")) == rows
     for row in rows:
         assert len(row["selected_indices"]) == 8
@@ -92,7 +97,7 @@ def test_all_phasefuse_arms_share_candidates_and_emit_exact_source_budget(
         assert max(row["selected_timestamps_sec"]) <= global_support[1] + 1e-12
     for origin_id in range(2):
         arm_rows = [row for row in rows if row["origin_id"] == origin_id]
-        assert {row["method"] for row in arm_rows} == set(PHASEFUSE_METHODS)
+        assert {row["method"] for row in arm_rows} == set(config.methods)
         assert len({tuple(row["source_frame_indices"]) for row in arm_rows}) == 1
         assert len({tuple(row["timestamps_sec"]) for row in arm_rows}) == 1
 
@@ -152,8 +157,95 @@ def test_method_subset_and_config_validation(tmp_path: Path):
     )
     assert loaded.methods == ("dense_topk_mmr", "phasefuse")
     assert loaded.legacy_selection.lambda_param == pytest.approx(0.4)
+    upgraded = config_from_mapping(
+        {
+            "methods": ["dense_swt", "phasefuse_v2"],
+            "frame_budget": 16,
+            "num_phases": 4,
+            "selection_strategy": "global_coverage",
+            "uniform_reserve": 8,
+            "selection_event_weight": 0.25,
+            "component_scaling": "percentile",
+            "min_selection_distance_sec": 0.5,
+        }
+    )
+    assert upgraded.methods == ("dense_swt", "phasefuse_v2")
+    assert upgraded.selection_strategy == "global_coverage"
+    assert upgraded.uniform_reserve == 8
+    assert upgraded.selection_event_weight == pytest.approx(0.25)
+    assert upgraded.component_scaling == "percentile"
+    assert upgraded.min_selection_distance_sec == pytest.approx(0.5)
+    assert PhaseFuseExperimentConfig(frame_budget=4).uniform_reserve == 8
+    with pytest.raises(ValueError, match="cannot exceed"):
+        PhaseFuseExperimentConfig(
+            methods=("phasefuse_v2",),
+            frame_budget=4,
+        )
     with pytest.raises(ValueError, match="unsupported"):
         config_from_mapping({"methods": ["unknown"]})
+
+    file_config = load_phasefuse_config(
+        Path(__file__).parents[1] / "configs" / "phasefuse_v2_dev20.yaml"
+    )
+    assert file_config.experiment.methods == (
+        "dense_swt",
+        "phasefuse",
+        "phasefuse_v2",
+    )
+    assert file_config.experiment.uniform_reserve == 8
+    assert file_config.metadata["main_method"] == "phasefuse_v2"
+
+
+def test_phasefuse_v2_is_global_four_phase_median_and_keeps_v1_unchanged(
+    tmp_path: Path,
+):
+    records = _records(tmp_path)
+    config = PhaseFuseExperimentConfig(
+        methods=("phasefuse", "phasefuse_v2"),
+        frame_budget=8,
+        min_frames_per_segment=2,
+        uniform_reserve=4,
+    )
+    rows = run_phasefuse_experiment(records, tmp_path / "v2", config=config)
+    by_method = {row["method"]: row for row in rows if row["origin_id"] == 0}
+
+    v1_config = by_method["phasefuse"]["method_metadata"]["phasefuse"]["config"]
+    v2 = by_method["phasefuse_v2"]
+    v2_metadata = v2["method_metadata"]
+    v2_config = v2_metadata["phasefuse"]["config"]
+
+    assert v1_config["selection_strategy"] == "segmented"
+    assert v1_config["uniform_reserve"] == 0
+    assert v1_config["uncertainty_penalty"] == pytest.approx(0.25)
+    assert v1_config["relevance_weight"] == pytest.approx(0.5)
+    assert v1_config["phase_vote_weight"] == pytest.approx(0.25)
+
+    assert v2_metadata["selector_kind"] == "multiphase_fusion"
+    assert v2_metadata["selection_strategy"] == "global_coverage"
+    assert v2["selection_strategy"] == "global_coverage"
+    assert v2_config["num_phases"] == 4
+    assert v2_config["consensus"] == "median"
+    assert v2_config["selection_strategy"] == "global_coverage"
+    assert v2_config["uniform_reserve"] == 4
+    assert v2_config["selection_event_weight"] == pytest.approx(0.25)
+    assert v2_config["component_scaling"] == "percentile"
+    assert v2_config["min_selection_distance_sec"] == pytest.approx(0.5)
+    assert v2_config["uncertainty_penalty"] == pytest.approx(0.0)
+    assert v2_config["relevance_weight"] == pytest.approx(0.0)
+    assert v2_config["phase_vote_weight"] == pytest.approx(0.0)
+    assert len(v2_metadata["phasefuse"]["anchor_indices"]) == 4
+    assert v2["peaks"] == []
+    assert v2["allocation"] == {"0": 8}
+
+    summary = json.loads((tmp_path / "v2" / "summary.json").read_text())
+    assert summary["config"]["selection_strategy"] == "global_coverage"
+    assert summary["config"]["uniform_reserve"] == 4
+
+    with pytest.raises(ValueError, match="exactly four"):
+        PhaseFuseExperimentConfig(
+            methods=("phasefuse_v2",),
+            num_phases=2,
+        )
 
 
 def test_dense_feature_provenance_rejects_post_record_tampering(tmp_path: Path):
@@ -201,9 +293,10 @@ def test_phasefuse_cli_commands_are_exposed():
             "--methods",
             "dense_swt",
             "phasefuse",
+            "phasefuse_v2",
         ]
     )
-    assert run.methods == ["dense_swt", "phasefuse"]
+    assert run.methods == ["dense_swt", "phasefuse", "phasefuse_v2"]
     downstream = parser.parse_args(
         [
             "evaluate-phasefuse-predictions",

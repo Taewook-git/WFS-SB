@@ -49,16 +49,31 @@ class PhaseFuseConfig:
     mmr_visual_weight: float = 0.75
     temporal_redundancy_scale_sec: float = 2.0
     short_phase_policy: Literal["error", "single_stream"] = "single_stream"
+    selection_strategy: Literal["segmented", "global_coverage"] = "segmented"
+    uniform_reserve: int = 0
+    selection_event_weight: float = 1.0
+    component_scaling: Literal["robust_z", "percentile"] = "robust_z"
+    min_selection_distance_sec: float = 0.0
 
     def __post_init__(self) -> None:
-        for name in ("num_phases", "frame_budget", "min_frames_per_segment"):
+        for name in (
+            "num_phases",
+            "frame_budget",
+            "min_frames_per_segment",
+            "uniform_reserve",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
                 raise TypeError(f"{name} must be an integer")
-            if int(value) <= 0:
+            if name == "uniform_reserve":
+                if int(value) < 0:
+                    raise ValueError("uniform_reserve must be non-negative")
+            elif int(value) <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.min_frames_per_segment > self.frame_budget:
             raise ValueError("min_frames_per_segment cannot exceed frame_budget")
+        if self.uniform_reserve > self.frame_budget:
+            raise ValueError("uniform_reserve cannot exceed frame_budget")
         nonnegative = (
             "min_boundary_distance_sec",
             "boundary_threshold_mad",
@@ -70,6 +85,8 @@ class PhaseFuseConfig:
             "segment_event_weight",
             "segment_diversity_weight",
             "segment_uncertainty_penalty",
+            "selection_event_weight",
+            "min_selection_distance_sec",
         )
         for name in nonnegative:
             value = float(getattr(self, name))
@@ -98,6 +115,12 @@ class PhaseFuseConfig:
             raise ValueError("consensus must be 'median' or 'mean'")
         if self.short_phase_policy not in {"error", "single_stream"}:
             raise ValueError("short_phase_policy must be 'error' or 'single_stream'")
+        if self.selection_strategy not in {"segmented", "global_coverage"}:
+            raise ValueError(
+                "selection_strategy must be 'segmented' or 'global_coverage'"
+            )
+        if self.component_scaling not in {"robust_z", "percentile"}:
+            raise ValueError("component_scaling must be 'robust_z' or 'percentile'")
 
 
 @dataclass
@@ -129,6 +152,7 @@ class PhaseFuseTrace:
     segments: tuple[tuple[int, int], ...]
     segment_utilities: np.ndarray
     allocation: np.ndarray
+    anchor_indices: np.ndarray
     selected_indices: np.ndarray
     used_fallback: bool
     fallback_reason: str | None
@@ -176,6 +200,10 @@ class PhaseFuseTrace:
             "segments": [list(segment) for segment in self.segments],
             "segment_utilities": self.segment_utilities.astype(float).tolist(),
             "allocation": self.allocation.astype(int).tolist(),
+            "anchor_indices": self.anchor_indices.astype(int).tolist(),
+            "anchor_timestamps_sec": self.timestamps_sec[self.anchor_indices]
+            .astype(float)
+            .tolist(),
             "selected_indices": self.selected_indices.astype(int).tolist(),
             "selected_dense_indices": self.selected_indices.astype(int).tolist(),
             "selected_timestamps_sec": self.selected_timestamps_sec.astype(
@@ -319,6 +347,41 @@ def _positive_robust_normalize(values: np.ndarray) -> np.ndarray:
         return result
     result[finite] = np.maximum((observed - location) / scale, 0.0)
     return result
+
+
+def _percentile_rank_scale(values: np.ndarray) -> np.ndarray:
+    """Map finite values to tie-aware empirical ranks in ``[0, 1]``.
+
+    Only ordering affects the result, so changing the amplitude of an extreme
+    observation cannot rescale every other candidate.  Equal-valued constant
+    components carry no discriminative evidence and map to zero.
+    """
+
+    result = np.zeros_like(values, dtype=float)
+    finite = np.isfinite(values)
+    result[~finite] = np.nan
+    observed = values[finite]
+    if observed.size == 0:
+        raise ValueError("at least one finite value is required")
+    unique, inverse, counts = np.unique(
+        observed, return_inverse=True, return_counts=True
+    )
+    if unique.size == 1:
+        return result
+    starts = np.cumsum(np.concatenate(([0], counts[:-1])))
+    midranks = starts + (counts - 1) / 2.0
+    result[finite] = midranks[inverse] / float(observed.size - 1)
+    return result
+
+
+def _scale_component(
+    values: np.ndarray, method: Literal["robust_z", "percentile"]
+) -> np.ndarray:
+    if method == "robust_z":
+        return _positive_robust_normalize(values)
+    if method == "percentile":
+        return _percentile_rank_scale(values)
+    raise ValueError("unknown component scaling")  # pragma: no cover - config guards
 
 
 def robust_phase_consensus(
@@ -669,6 +732,134 @@ def select_mmr_indices(
     )
 
 
+def _uniform_coverage_indices(
+    candidate_indices: np.ndarray,
+    timestamps_sec: np.ndarray,
+    count: int,
+) -> np.ndarray:
+    """Choose exact deterministic temporal anchors at uniform bin centers."""
+
+    if count == 0:
+        return np.asarray([], dtype=int)
+    if count > candidate_indices.size:  # pragma: no cover - caller validates budget
+        raise ValueError("uniform anchor count exceeds candidate count")
+    first_time = float(timestamps_sec[candidate_indices[0]])
+    last_time = float(timestamps_sec[candidate_indices[-1]])
+    fractions = (np.arange(count, dtype=float) + 0.5) / float(count)
+    targets = first_time + fractions * (last_time - first_time)
+    available = set(int(index) for index in candidate_indices)
+    selected: list[int] = []
+    for target in targets:
+        best = min(
+            available,
+            key=lambda index: (abs(float(timestamps_sec[index]) - target), index),
+        )
+        selected.append(best)
+        available.remove(best)
+    return np.asarray(sorted(selected), dtype=int)
+
+
+def _seeded_global_mmr_indices(
+    candidate_indices: np.ndarray,
+    token_scores: np.ndarray,
+    total_count: int,
+    *,
+    seed_indices: np.ndarray,
+    features: np.ndarray | None,
+    timestamps_sec: np.ndarray,
+    lambda_param: float,
+    visual_weight: float,
+    temporal_scale_sec: float,
+    min_distance_sec: float,
+) -> np.ndarray | None:
+    """Run one global MMR pass whose redundancy state starts with anchors.
+
+    ``None`` means the requested minimum temporal distance made the exact
+    budget infeasible for this deterministic greedy pass.  Callers may then
+    retry with a relaxed distance while keeping the same anchors.
+    """
+
+    selected = seed_indices.astype(int).tolist()
+    if len(selected) > total_count:
+        raise ValueError("seed count exceeds total_count")
+    if len(selected) > 1 and np.any(
+        np.diff(timestamps_sec[np.asarray(selected, dtype=int)]) < min_distance_sec
+    ):
+        return None
+    available = set(int(index) for index in candidate_indices) - set(selected)
+    candidate_scores = token_scores[candidate_indices]
+    span = float(np.max(candidate_scores) - np.min(candidate_scores))
+    if span <= np.finfo(float).eps:
+        normalized_scores = np.ones(token_scores.size, dtype=float)
+    else:
+        normalized_scores = np.zeros(token_scores.size, dtype=float)
+        normalized_scores[candidate_indices] = (
+            candidate_scores - float(np.min(candidate_scores))
+        ) / span
+
+    normalized_features = None
+    if features is not None:
+        normalized_features = np.zeros_like(features, dtype=float)
+        norms = np.linalg.norm(features, axis=1)
+        nonzero = norms > np.finfo(float).eps
+        normalized_features[nonzero] = features[nonzero] / norms[nonzero, None]
+
+    while len(selected) < total_count:
+        eligible = [
+            index
+            for index in sorted(available)
+            if all(
+                abs(float(timestamps_sec[index] - timestamps_sec[prior]))
+                >= min_distance_sec
+                for prior in selected
+            )
+        ]
+        if not eligible:
+            return None
+        best_index = None
+        best_score = -np.inf
+        for index in eligible:
+            redundancy = 0.0
+            if selected:
+                temporal = max(
+                    np.exp(
+                        -abs(float(timestamps_sec[index] - timestamps_sec[prior]))
+                        / temporal_scale_sec
+                    )
+                    for prior in selected
+                )
+                if normalized_features is None:
+                    redundancy = float(temporal)
+                else:
+                    visual = max(
+                        max(
+                            0.0,
+                            float(
+                                np.dot(
+                                    normalized_features[index],
+                                    normalized_features[prior],
+                                )
+                            ),
+                        )
+                        for prior in selected
+                    )
+                    redundancy = float(
+                        visual_weight * visual + (1.0 - visual_weight) * temporal
+                    )
+            score = float(
+                lambda_param * normalized_scores[index]
+                - (1.0 - lambda_param) * redundancy
+            )
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index is None:  # pragma: no cover - eligible is non-empty
+            raise RuntimeError("global MMR selection stalled")
+        selected.append(best_index)
+        available.remove(best_index)
+    return np.asarray(sorted(selected), dtype=int)
+
+
 def _local_maxima_mask(values: np.ndarray) -> np.ndarray:
     mask = np.zeros(values.size, dtype=bool)
     if values.size >= 3:
@@ -897,7 +1088,7 @@ def run_phasefuse(
     # Normalize each phase independently so a transform-amplitude difference
     # cannot give one sampling phase more influence in the consensus.
     normalized_aligned = np.vstack(
-        [_positive_robust_normalize(row) for row in masked_aligned]
+        [_scale_component(row, config.component_scaling) for row in masked_aligned]
     )
     support_count = np.sum(support, axis=0)
     consensus = np.zeros(timestamps.size, dtype=float)
@@ -917,98 +1108,155 @@ def run_phasefuse(
     masked_relevance = np.full(timestamps.size, np.nan, dtype=float)
     masked_relevance[fusion_domain] = relevance[fusion_domain]
     normalized_relevance = np.nan_to_num(
-        _positive_robust_normalize(masked_relevance), nan=0.0
+        _scale_component(masked_relevance, config.component_scaling), nan=0.0
     )
-    event = (
-        consensus
-        - config.uncertainty_penalty * uncertainty
-        + config.phase_vote_weight * phase_vote
-        + config.relevance_weight * normalized_relevance
-    )
+    event = consensus - config.uncertainty_penalty * uncertainty
+    event += config.phase_vote_weight * phase_vote
+    if config.selection_strategy == "segmented":
+        # Preserve the original PhaseFuse definition and selection behavior.
+        event += config.relevance_weight * normalized_relevance
     if not np.all(np.isfinite(event)):
         raise RuntimeError("phase fusion produced non-finite event scores")
     event_location = float(np.median(event[fusion_domain]))
     event_mad = 1.4826 * float(np.median(np.abs(event[fusion_domain] - event_location)))
     threshold = event_location + config.boundary_threshold_mad * event_mad
-    candidate_mask = full_support & input_valid & _local_maxima_mask(event)
-    weights = np.maximum(event - threshold, 0.0)
-    max_boundaries = max(
-        0,
-        config.frame_budget // config.min_frames_per_segment - 1,
-    )
-    if max_boundaries == 0 or timestamps.size < 3:
+    anchor_indices = np.asarray([], dtype=int)
+    if config.selection_strategy == "global_coverage":
+        # PhaseFuse v2 deliberately removes event-derived hard segmentation.
+        candidate_mask = np.zeros(timestamps.size, dtype=bool)
         boundaries = np.asarray([], dtype=int)
-    else:
-        boundaries = select_weighted_interval_indices(
+        segments = ((0, int(timestamps.size)),)
+        utilities = _segment_utilities(
+            segments,
             timestamps,
-            weights,
-            max_boundaries,
-            config.min_boundary_distance_sec,
-            valid_mask=candidate_mask,
-            min_index_distance=1,
-            edge_margin=1,
-            segment_capacity_mask=selectable,
-            min_segment_capacity=config.min_frames_per_segment,
+            normalized_relevance,
+            event,
+            uncertainty,
+            feature_matrix,
+            selectable,
+            config,
         )
-    boundaries, repaired = _repair_boundaries_for_capacity(
-        boundaries,
-        weights,
-        selectable,
-        config.min_frames_per_segment,
-    )
-    if repaired:
-        used_fallback = True
-        repair_reason = "segment_capacity_repair"
-        fallback_reason = (
-            repair_reason
-            if fallback_reason is None
-            else f"{fallback_reason};{repair_reason}"
+        allocation = np.asarray([config.frame_budget], dtype=int)
+        candidates = np.flatnonzero(selectable)
+        anchor_indices = _uniform_coverage_indices(
+            candidates, timestamps, config.uniform_reserve
         )
-    if boundaries.size == 0 and not used_fallback:
-        used_fallback = True
-        fallback_reason = (
-            "boundary_budget_zero"
-            if max_boundaries == 0
-            else "no_positive_boundary_evidence"
+        # Relevance appears exactly once in the token score.  Event saliency is
+        # independently tunable and uncertainty may be kept diagnostic-only by
+        # setting uncertainty_penalty=0.
+        token_scores = normalized_relevance + config.selection_event_weight * event
+        selected = _seeded_global_mmr_indices(
+            candidates,
+            token_scores,
+            config.frame_budget,
+            seed_indices=anchor_indices,
+            features=feature_matrix,
+            timestamps_sec=timestamps,
+            lambda_param=config.mmr_lambda,
+            visual_weight=config.mmr_visual_weight,
+            temporal_scale_sec=config.temporal_redundancy_scale_sec,
+            min_distance_sec=config.min_selection_distance_sec,
         )
-    segments = _segments_from_boundaries(boundaries, timestamps.size)
-    utilities = _segment_utilities(
-        segments,
-        timestamps,
-        normalized_relevance,
-        event,
-        uncertainty,
-        feature_matrix,
-        selectable,
-        config,
-    )
-    capacities = np.asarray(
-        [int(np.sum(selectable[start:stop])) for start, stop in segments], dtype=int
-    )
-    allocation = allocate_exact_budget(
-        capacities,
-        utilities,
-        config.frame_budget,
-        min_per_segment=config.min_frames_per_segment,
-        temperature=config.allocation_temperature,
-    )
-    selection_relevance = normalized_relevance + event
-    selected_rows: list[int] = []
-    for (start, stop), count in zip(segments, allocation):
-        candidates = np.flatnonzero(selectable[start:stop]) + start
-        selected_rows.extend(
-            select_mmr_indices(
+        if selected is None:
+            selected = _seeded_global_mmr_indices(
                 candidates,
-                selection_relevance,
-                int(count),
+                token_scores,
+                config.frame_budget,
+                seed_indices=anchor_indices,
                 features=feature_matrix,
                 timestamps_sec=timestamps,
                 lambda_param=config.mmr_lambda,
                 visual_weight=config.mmr_visual_weight,
                 temporal_scale_sec=config.temporal_redundancy_scale_sec,
-            ).tolist()
+                min_distance_sec=0.0,
+            )
+            if selected is None:  # pragma: no cover - zero distance is feasible
+                raise RuntimeError("global MMR failed after distance relaxation")
+            used_fallback = True
+            reason = "min_selection_distance_relaxed"
+            fallback_reason = (
+                reason if fallback_reason is None else f"{fallback_reason};{reason}"
+            )
+    else:
+        candidate_mask = full_support & input_valid & _local_maxima_mask(event)
+        weights = np.maximum(event - threshold, 0.0)
+        max_boundaries = max(
+            0,
+            config.frame_budget // config.min_frames_per_segment - 1,
         )
-    selected = np.asarray(sorted(selected_rows), dtype=int)
+        if max_boundaries == 0 or timestamps.size < 3:
+            boundaries = np.asarray([], dtype=int)
+        else:
+            boundaries = select_weighted_interval_indices(
+                timestamps,
+                weights,
+                max_boundaries,
+                config.min_boundary_distance_sec,
+                valid_mask=candidate_mask,
+                min_index_distance=1,
+                edge_margin=1,
+                segment_capacity_mask=selectable,
+                min_segment_capacity=config.min_frames_per_segment,
+            )
+        boundaries, repaired = _repair_boundaries_for_capacity(
+            boundaries,
+            weights,
+            selectable,
+            config.min_frames_per_segment,
+        )
+        if repaired:
+            used_fallback = True
+            repair_reason = "segment_capacity_repair"
+            fallback_reason = (
+                repair_reason
+                if fallback_reason is None
+                else f"{fallback_reason};{repair_reason}"
+            )
+        if boundaries.size == 0 and not used_fallback:
+            used_fallback = True
+            fallback_reason = (
+                "boundary_budget_zero"
+                if max_boundaries == 0
+                else "no_positive_boundary_evidence"
+            )
+        segments = _segments_from_boundaries(boundaries, timestamps.size)
+        utilities = _segment_utilities(
+            segments,
+            timestamps,
+            normalized_relevance,
+            event,
+            uncertainty,
+            feature_matrix,
+            selectable,
+            config,
+        )
+        capacities = np.asarray(
+            [int(np.sum(selectable[start:stop])) for start, stop in segments], dtype=int
+        )
+        allocation = allocate_exact_budget(
+            capacities,
+            utilities,
+            config.frame_budget,
+            min_per_segment=config.min_frames_per_segment,
+            temperature=config.allocation_temperature,
+        )
+        selection_relevance = normalized_relevance + event
+        selected_rows: list[int] = []
+        for (start, stop), count in zip(segments, allocation):
+            candidates = np.flatnonzero(selectable[start:stop]) + start
+            selected_rows.extend(
+                select_mmr_indices(
+                    candidates,
+                    selection_relevance,
+                    int(count),
+                    features=feature_matrix,
+                    timestamps_sec=timestamps,
+                    lambda_param=config.mmr_lambda,
+                    visual_weight=config.mmr_visual_weight,
+                    temporal_scale_sec=config.temporal_redundancy_scale_sec,
+                ).tolist()
+            )
+        selected = np.asarray(sorted(selected_rows), dtype=int)
     if (
         selected.size != config.frame_budget
         or np.unique(selected).size != selected.size
@@ -1045,6 +1293,7 @@ def run_phasefuse(
         segments=segments,
         segment_utilities=utilities,
         allocation=allocation,
+        anchor_indices=anchor_indices,
         selected_indices=selected,
         used_fallback=used_fallback,
         fallback_reason=fallback_reason,

@@ -62,6 +62,14 @@ def test_config_rejects_invalid_values():
         PhaseFuseConfig(allocation_temperature=0.0)
     with pytest.raises(ValueError, match="cannot exceed"):
         PhaseFuseConfig(frame_budget=3, min_frames_per_segment=4)
+    with pytest.raises(ValueError, match="uniform_reserve"):
+        PhaseFuseConfig(frame_budget=3, uniform_reserve=4)
+    with pytest.raises(ValueError, match="selection_strategy"):
+        PhaseFuseConfig(selection_strategy="boundaries")
+    with pytest.raises(ValueError, match="component_scaling"):
+        PhaseFuseConfig(component_scaling="minmax")
+    with pytest.raises(ValueError, match="min_selection_distance_sec"):
+        PhaseFuseConfig(min_selection_distance_sec=-0.1)
 
 
 def test_interleaved_phase_ids_handles_remainder():
@@ -408,6 +416,230 @@ def test_phasefuse_wrapper_matches_function_and_repeats_deterministically():
     second = selector.run(timestamps, relevance)
     np.testing.assert_array_equal(first.selected_indices, second.selected_indices)
     np.testing.assert_array_equal(first.boundary_indices, second.boundary_indices)
+
+
+def test_default_segmented_selection_preserves_v1_fingerprint():
+    timestamps = np.arange(24, dtype=float) * 0.5
+    relevance = np.asarray(
+        [
+            0.0,
+            0.2,
+            0.1,
+            0.4,
+            0.3,
+            0.8,
+            0.2,
+            0.1,
+            0.9,
+            0.4,
+            0.2,
+            0.7,
+            0.1,
+            0.3,
+            0.6,
+            0.2,
+            0.8,
+            0.1,
+            0.5,
+            0.2,
+            0.9,
+            0.1,
+            0.4,
+            0.2,
+        ]
+    )
+    features = np.column_stack((np.sin(timestamps), np.cos(timestamps)))
+    trace = run_phasefuse(
+        timestamps,
+        relevance,
+        features,
+        config=PhaseFuseConfig(
+            num_phases=2,
+            frame_budget=6,
+            min_boundary_distance_sec=1.0,
+        ),
+        transform=IdentityTransform(),
+    )
+    assert trace.config.selection_strategy == "segmented"
+    assert trace.boundary_indices.tolist() == [5, 8, 11, 16, 20]
+    assert trace.selected_indices.tolist() == [3, 5, 8, 11, 16, 20]
+    assert trace.anchor_indices.size == 0
+
+
+def test_percentile_component_scaling_is_bounded_and_outlier_magnitude_invariant():
+    timestamps = np.arange(20, dtype=float)
+    base = np.linspace(0.0, 1.0, 20)
+    extreme = base.copy()
+    extreme[-1] = 1_000_000.0
+    config = PhaseFuseConfig(
+        num_phases=1,
+        frame_budget=6,
+        selection_strategy="global_coverage",
+        component_scaling="percentile",
+    )
+    first = run_phasefuse(
+        timestamps, base, None, config=config, transform=IdentityTransform()
+    )
+    second = run_phasefuse(
+        timestamps, extreme, None, config=config, transform=IdentityTransform()
+    )
+    assert np.all((first.normalized_relevance >= 0) & (first.normalized_relevance <= 1))
+    assert np.all(
+        (second.normalized_relevance >= 0) & (second.normalized_relevance <= 1)
+    )
+    np.testing.assert_allclose(first.normalized_relevance, second.normalized_relevance)
+    np.testing.assert_allclose(
+        first.normalized_aligned_phase_saliency,
+        second.normalized_aligned_phase_saliency,
+    )
+    np.testing.assert_array_equal(first.selected_indices, second.selected_indices)
+
+
+def test_global_coverage_reserves_exact_uniform_anchors_without_boundaries():
+    trace = _run_flat(
+        num_samples=32,
+        config=PhaseFuseConfig(
+            num_phases=1,
+            frame_budget=8,
+            selection_strategy="global_coverage",
+            uniform_reserve=4,
+            component_scaling="percentile",
+        ),
+    )
+    assert trace.anchor_indices.tolist() == [4, 12, 19, 27]
+    assert set(trace.anchor_indices).issubset(set(trace.selected_indices))
+    assert trace.anchor_indices.size == 4
+    assert trace.boundary_indices.size == 0
+    assert not np.any(trace.boundary_candidate_mask)
+    assert trace.segments == ((0, 32),)
+    assert trace.allocation.tolist() == [8]
+    assert trace.to_dict()["anchor_indices"] == [4, 12, 19, 27]
+
+
+def test_global_mmr_is_seeded_by_anchors_and_avoids_near_cosine_duplicate():
+    timestamps = np.arange(12, dtype=float)
+    relevance = np.zeros(12)
+    relevance[[2, 3, 8]] = [1.0, 1.0, 0.9]
+    features = np.zeros((12, 3))
+    features[:, 2] = 1.0
+    features[2] = [1.0, 0.0, 0.0]
+    features[3] = [0.999, 0.001, 0.0]
+    features[8] = [0.0, 1.0, 0.0]
+    trace = run_phasefuse(
+        timestamps,
+        relevance,
+        features,
+        config=PhaseFuseConfig(
+            num_phases=1,
+            frame_budget=4,
+            selection_strategy="global_coverage",
+            uniform_reserve=2,
+            component_scaling="percentile",
+            selection_event_weight=0.0,
+            mmr_lambda=0.25,
+            mmr_visual_weight=1.0,
+            min_selection_distance_sec=1.5,
+        ),
+        transform=IdentityTransform(),
+    )
+    assert set(trace.anchor_indices).issubset(trace.selected_indices)
+    assert not ({2, 3} <= set(trace.selected_indices))
+    assert np.min(np.diff(trace.selected_timestamps_sec)) >= 1.5
+
+
+def test_global_minimum_distance_has_deterministic_relaxation_fallback():
+    config = PhaseFuseConfig(
+        num_phases=1,
+        frame_budget=5,
+        selection_strategy="global_coverage",
+        uniform_reserve=2,
+        min_selection_distance_sec=100.0,
+    )
+    first = _run_flat(num_samples=10, config=config)
+    second = _run_flat(num_samples=10, config=config)
+    assert first.selected_indices.size == 5
+    assert first.fallback_reason == "min_selection_distance_relaxed"
+    np.testing.assert_array_equal(first.selected_indices, second.selected_indices)
+
+
+def test_global_coverage_is_tolerant_to_subframe_outer_origin_shift():
+    config = PhaseFuseConfig(
+        num_phases=4,
+        frame_budget=10,
+        selection_strategy="global_coverage",
+        uniform_reserve=5,
+        component_scaling="percentile",
+        selection_event_weight=0.25,
+        uncertainty_penalty=0.0,
+        phase_vote_weight=0.0,
+        min_selection_distance_sec=0.5,
+    )
+
+    def select(offset):
+        timestamps = offset + np.arange(80, dtype=float) * 0.25
+        relevance = (
+            0.2
+            + 0.8 * np.exp(-np.square((timestamps - 5.0) / 0.8))
+            + 0.6 * np.exp(-np.square((timestamps - 13.0) / 1.2))
+            + 0.1 * np.square(np.sin(timestamps * 0.7))
+        )
+        features = np.column_stack(
+            (np.sin(timestamps * 0.4), np.cos(timestamps * 0.4), relevance)
+        )
+        return run_phasefuse(
+            timestamps,
+            relevance,
+            features,
+            config=config,
+            transform=IdentityTransform(),
+        )
+
+    baseline = select(0.0)
+    shifted = select(0.125)
+    baseline_to_shifted = [
+        np.min(np.abs(value - shifted.selected_timestamps_sec))
+        for value in baseline.selected_timestamps_sec
+    ]
+    shifted_to_baseline = [
+        np.min(np.abs(value - baseline.selected_timestamps_sec))
+        for value in shifted.selected_timestamps_sec
+    ]
+    assert max((*baseline_to_shifted, *shifted_to_baseline)) <= 0.25
+
+
+def test_global_coverage_is_invariant_to_phase_label_permutation():
+    timestamps = np.arange(40, dtype=float) * 0.25
+    relevance = 0.3 + np.square(np.sin(timestamps))
+    phase_ids = interleaved_phase_ids(timestamps.size, 4)
+    permutation = np.asarray([2, 0, 3, 1])
+    config = PhaseFuseConfig(
+        num_phases=4,
+        frame_budget=8,
+        selection_strategy="global_coverage",
+        uniform_reserve=4,
+        component_scaling="percentile",
+        uncertainty_penalty=0.0,
+    )
+    original = run_phasefuse(
+        timestamps,
+        relevance,
+        None,
+        config=config,
+        transform=IdentityTransform(),
+        phase_ids=phase_ids,
+    )
+    relabeled = run_phasefuse(
+        timestamps,
+        relevance,
+        None,
+        config=config,
+        transform=IdentityTransform(),
+        phase_ids=permutation[phase_ids],
+    )
+    np.testing.assert_allclose(original.consensus, relabeled.consensus)
+    np.testing.assert_allclose(original.uncertainty, relabeled.uncertainty)
+    np.testing.assert_array_equal(original.anchor_indices, relabeled.anchor_indices)
+    np.testing.assert_array_equal(original.selected_indices, relabeled.selected_indices)
 
 
 def test_argument_validation_for_phase_and_source_maps():

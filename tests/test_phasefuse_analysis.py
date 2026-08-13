@@ -108,8 +108,28 @@ def test_selected_set_consistency_uses_canonical_source_frame_sets() -> None:
     assert result[0]["outer_origin_selected_set_uncertainty"] == pytest.approx(
         2.0 / 3.0
     )
+    assert result[0]["selected_timestamp_f1_at_0p25s_mean"] == pytest.approx(0.5)
+    assert result[0]["selected_timestamp_f1_at_0p5s_mean"] == pytest.approx(0.5)
     # At one-second tolerance, both selected timestamps can be matched.
+    assert result[0]["selected_timestamp_f1_at_1s_mean"] == pytest.approx(1.0)
     assert result[0]["selected_timestamp_f1_mean"] == pytest.approx(1.0)
+    assert result[0]["outer_origin_selector_uncertainty"] == pytest.approx(0.5)
+
+
+def test_primary_selector_stability_uses_actual_pts_not_exact_frame_ids() -> None:
+    first = _trace("main", "v1", 0, (0, 2))
+    second = _trace("main", "v1", 1, (1, 3))
+    second["actual_pts_sec"] = [0.0, 0.4, 2.0, 2.4]
+    second["selected_actual_pts_sec"] = [0.4, 2.4]
+
+    [result] = selected_set_consistency([first, second], method="main")
+
+    assert result["selected_set_consistency"] == pytest.approx(0.0)
+    assert result["selected_timestamp_f1_at_0p25s_mean"] == pytest.approx(0.0)
+    assert result["selected_timestamp_f1_at_0p5s_mean"] == pytest.approx(1.0)
+    assert result["selected_timestamp_f1_at_1s_mean"] == pytest.approx(1.0)
+    assert result["outer_origin_selector_uncertainty"] == pytest.approx(0.0)
+    assert result["outer_origin_selected_set_uncertainty"] == pytest.approx(1.0)
 
 
 def test_evaluate_phasefuse_is_compute_matched_and_bootstraps_video_clusters() -> None:
@@ -153,6 +173,30 @@ def test_evaluate_phasefuse_is_compute_matched_and_bootstraps_video_clusters() -
     ]["brier_score"] == pytest.approx(1.0)
     assert result["inner_phase_uncertainty"]["methods"]["treatment"]["status"] == (
         "unavailable"
+    )
+    assert result["schema_version"] == 1
+    assert result["selector_stability"]["primary"]["reference_metric"] == (
+        "selected_timestamp_f1_at_0p5s_mean"
+    )
+    assert result["selector_stability"]["secondary"]["reference_metric"] == (
+        "selected_set_consistency"
+    )
+    assert result["selector_stability"]["legacy_aliases"] == {
+        "selected_timestamp_f1_mean": "selected_timestamp_f1_at_1s_mean",
+        "selected_timestamp_f1_worst": "selected_timestamp_f1_at_1s_worst",
+    }
+    baseline_metrics = result["methods"]["baseline"]["metrics"]
+    # Schema-v1 fields remain available alongside the new primary PTS metrics.
+    assert {
+        "selected_set_consistency",
+        "selected_timestamp_f1_mean",
+        "selected_timestamp_f1_worst",
+        "outer_origin_selected_set_uncertainty",
+    } <= set(baseline_metrics)
+    assert "delta_selected_timestamp_f1_mean" in result["comparison"]["effect_order"]
+    assert (
+        "delta_outer_origin_selected_set_uncertainty"
+        in result["comparison"]["effect_order"]
     )
     # Public output must be strict-JSON serializable, including bootstrap arrays.
     json.dumps(result, allow_nan=False)
@@ -253,6 +297,73 @@ def test_inner_phase_uncertainty_is_reported_in_a_distinct_calibration_block() -
     json.dumps(result, allow_nan=False)
 
 
+@pytest.mark.parametrize(
+    ("baseline_method", "baseline_metadata"),
+    (
+        ("dense_swt", {}),
+        (
+            "baseline",
+            {
+                "selector_kind": "direct_dense_single_stream",
+                "phasefuse": {
+                    "num_phases": 1,
+                    "config": {"num_phases": 1},
+                },
+            },
+        ),
+    ),
+)
+def test_single_phase_inner_uncertainty_is_unavailable_not_numeric_zero(
+    baseline_method: str, baseline_metadata: dict[str, Any]
+) -> None:
+    rows: list[dict[str, Any]] = []
+    for origin_id in (0, 1):
+        baseline = _trace(baseline_method, "v1", origin_id, (0, 1))
+        baseline.update(
+            {
+                "selected_phase_uncertainty_mean": 0.0,
+                "selected_phase_uncertainty_max": 0.0,
+                "phase_uncertainty_mean": 0.0,
+                "method_metadata": baseline_metadata,
+            }
+        )
+        treatment = _trace("treatment", "v1", origin_id, (0, 2))
+        treatment.update(
+            {
+                "selected_phase_uncertainty_mean": 0.2,
+                "selected_phase_uncertainty_max": 0.3,
+                "phase_uncertainty_mean": 0.1,
+                "method_metadata": {
+                    "selector_kind": "multiphase_fusion",
+                    "phasefuse": {
+                        "num_phases": 4,
+                        "config": {"num_phases": 4},
+                    },
+                },
+            }
+        )
+        rows.extend((baseline, treatment))
+
+    result = evaluate_phasefuse_analysis(
+        rows,
+        baseline_method=baseline_method,
+        treatment_method="treatment",
+        n_bootstrap=5,
+    )
+
+    baseline_block = result["inner_phase_uncertainty"]["methods"][baseline_method]
+    assert baseline_block["status"] == "unavailable"
+    assert (
+        "single" in baseline_block["reason"]
+        or "num_phases<2" in baseline_block["reason"]
+    )
+    assert "raw_metrics" not in baseline_block
+    assert result["inner_phase_uncertainty"]["methods"]["treatment"]["status"] == (
+        "available"
+    )
+    assert result["inner_phase_uncertainty"]["comparison"]["status"] == "unavailable"
+
+
 def test_inner_phase_optional_fields_reject_partial_artifacts() -> None:
     rows = [
         _trace(method, "v1", origin, (0, 1))
@@ -276,6 +387,7 @@ def test_inner_phase_optional_fields_reject_partial_artifacts() -> None:
     (
         ("missing_origin", "rectangular origin grid"),
         ("candidate_mismatch", "candidate source frames do not align"),
+        ("actual_pts_mismatch", "candidate actual_pts_sec do not align"),
         ("budget_mismatch", "frame budgets are not compute-matched"),
         ("duplicate_selection", "must be unique"),
     ),
@@ -302,6 +414,9 @@ def test_evaluate_phasefuse_rejects_nonmatched_or_invalid_traces(
     elif mutation == "candidate_mismatch":
         target = next(row for row in rows if row["method"] == "treatment")
         target["source_frame_indices"] = [0, 1, 2, 99]
+    elif mutation == "actual_pts_mismatch":
+        target = next(row for row in rows if row["method"] == "treatment")
+        target["actual_pts_sec"] = [0.0, 1.0, 2.0, 3.1]
     elif mutation == "budget_mismatch":
         for row in rows:
             if row["method"] == "treatment":

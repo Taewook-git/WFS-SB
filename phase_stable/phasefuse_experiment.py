@@ -8,7 +8,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -25,7 +25,7 @@ from .pipeline import PhaseStableWFS, SelectionConfig, SelectionTrace
 from .repro import sha256_file
 from .transforms import TransformConfig, build_transform
 
-PHASEFUSE_METHODS = (
+PHASEFUSE_DEFAULT_METHODS = (
     "uniform_dense",
     "dense_topk_mmr",
     "single_dwt",
@@ -35,6 +35,7 @@ PHASEFUSE_METHODS = (
     "dense_swt",
     "phasefuse",
 )
+PHASEFUSE_METHODS = (*PHASEFUSE_DEFAULT_METHODS, "phasefuse_v2")
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,8 @@ class PhaseFuseFileConfig:
 class PhaseFuseExperimentConfig:
     """Frozen selection protocol shared by every compute-matched arm."""
 
-    methods: tuple[str, ...] = PHASEFUSE_METHODS
+    # V2 is supported but opt-in: upgrading must not add an expensive MLLM arm.
+    methods: tuple[str, ...] = PHASEFUSE_DEFAULT_METHODS
     frame_budget: int = 16
     num_phases: int = 4
     min_frames_per_segment: int = 2
@@ -73,6 +75,12 @@ class PhaseFuseExperimentConfig:
     mmr_lambda: float = 0.7
     mmr_visual_weight: float = 0.75
     temporal_redundancy_scale_sec: float = 2.0
+    # PhaseFuse-v2 selection controls. Original arms deliberately ignore these.
+    selection_strategy: Literal["segmented", "global_coverage"] = "global_coverage"
+    uniform_reserve: int = 8
+    selection_event_weight: float = 0.25
+    component_scaling: Literal["robust_z", "percentile"] = "percentile"
+    min_selection_distance_sec: float = 0.5
     legacy_selection: SelectionConfig = field(default_factory=SelectionConfig)
 
     def __post_init__(self) -> None:
@@ -99,6 +107,27 @@ class PhaseFuseExperimentConfig:
             raise ValueError("level must be a positive integer or null")
         if self.min_frames_per_segment > self.frame_budget:
             raise ValueError("min_frames_per_segment cannot exceed frame_budget")
+        if (
+            isinstance(self.uniform_reserve, bool)
+            or not isinstance(self.uniform_reserve, int)
+            or self.uniform_reserve < 0
+        ):
+            raise ValueError("uniform_reserve must be a non-negative integer")
+        if self.selection_strategy not in {"segmented", "global_coverage"}:
+            raise ValueError(
+                "selection_strategy must be 'segmented' or 'global_coverage'"
+            )
+        if self.component_scaling not in {"robust_z", "percentile"}:
+            raise ValueError("component_scaling must be 'robust_z' or 'percentile'")
+        if "phasefuse_v2" in methods:
+            if self.num_phases != 4:
+                raise ValueError("phasefuse_v2 requires exactly four physical phases")
+            if self.selection_strategy != "global_coverage":
+                raise ValueError("phasefuse_v2 requires global_coverage selection")
+            if self.uniform_reserve > self.frame_budget:
+                raise ValueError(
+                    "phasefuse_v2 uniform_reserve cannot exceed frame_budget"
+                )
         numeric = (
             "min_boundary_distance_sec",
             "boundary_threshold_mad",
@@ -114,11 +143,17 @@ class PhaseFuseExperimentConfig:
             "mmr_lambda",
             "mmr_visual_weight",
             "temporal_redundancy_scale_sec",
+            "selection_event_weight",
+            "min_selection_distance_sec",
         )
         for name in numeric:
             value = float(getattr(self, name))
             if not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
+        if self.selection_event_weight < 0:
+            raise ValueError("selection_event_weight must be non-negative")
+        if self.min_selection_distance_sec < 0:
+            raise ValueError("min_selection_distance_sec must be non-negative")
         object.__setattr__(self, "methods", methods)
 
     def selector_config(
@@ -127,7 +162,19 @@ class PhaseFuseExperimentConfig:
         num_phases: int | None = None,
         consensus: str = "median",
         uncertainty_penalty: float | None = None,
+        relevance_weight: float | None = None,
+        phase_vote_weight: float | None = None,
+        use_v2_selection: bool = False,
     ) -> PhaseFuseConfig:
+        strategy_options: dict[str, Any] = {}
+        if use_v2_selection:
+            strategy_options = {
+                "selection_strategy": self.selection_strategy,
+                "uniform_reserve": self.uniform_reserve,
+                "selection_event_weight": self.selection_event_weight,
+                "component_scaling": self.component_scaling,
+                "min_selection_distance_sec": self.min_selection_distance_sec,
+            }
         return PhaseFuseConfig(
             num_phases=self.num_phases if num_phases is None else num_phases,
             frame_budget=self.frame_budget,
@@ -139,8 +186,14 @@ class PhaseFuseExperimentConfig:
                 if uncertainty_penalty is None
                 else uncertainty_penalty
             ),
-            relevance_weight=self.relevance_weight,
-            phase_vote_weight=self.phase_vote_weight,
+            relevance_weight=(
+                self.relevance_weight if relevance_weight is None else relevance_weight
+            ),
+            phase_vote_weight=(
+                self.phase_vote_weight
+                if phase_vote_weight is None
+                else phase_vote_weight
+            ),
             consensus=consensus,  # type: ignore[arg-type]
             segment_duration_weight=self.segment_duration_weight,
             segment_relevance_weight=self.segment_relevance_weight,
@@ -151,6 +204,7 @@ class PhaseFuseExperimentConfig:
             mmr_lambda=self.mmr_lambda,
             mmr_visual_weight=self.mmr_visual_weight,
             temporal_redundancy_scale_sec=self.temporal_redundancy_scale_sec,
+            **strategy_options,
         )
 
 
@@ -182,9 +236,7 @@ def _record_contract(
     phase_ids = np.asarray(contract.get("phase_ids"), dtype=int)
     if phase_ids.shape != (len(record.timestamps_sec),):
         raise ValueError("record phase_ids are not dense-target aligned")
-    support = np.asarray(
-        contract.get("manifest_common_valid_support_sec"), dtype=float
-    )
+    support = np.asarray(contract.get("manifest_common_valid_support_sec"), dtype=float)
     if (
         support.shape != (2,)
         or not np.all(np.isfinite(support))
@@ -292,6 +344,11 @@ def _phasefuse_result(trace: PhaseFuseTrace, *, kind: str) -> _SelectionResult:
         "max_boundary_count": int(
             trace.config.frame_budget // trace.config.min_frames_per_segment - 1
         ),
+        "selection_strategy": trace.config.selection_strategy,
+        "component_scaling": trace.config.component_scaling,
+        "uniform_reserve": int(trace.config.uniform_reserve),
+        "selection_event_weight": float(trace.config.selection_event_weight),
+        "min_selection_distance_sec": float(trace.config.min_selection_distance_sec),
     }
     arrays = {
         "consensus": trace.consensus,
@@ -325,7 +382,10 @@ def _run_fused(
     transform_method: str,
     consensus: str = "median",
     uncertainty_penalty: float | None = None,
+    relevance_weight: float | None = None,
+    phase_vote_weight: float | None = None,
     dense_single_stream: bool = False,
+    use_v2_selection: bool = False,
 ) -> _SelectionResult:
     timestamps = np.asarray(record.timestamps_sec, dtype=float)
     valid = (timestamps >= support[0] - 1e-12) & (timestamps <= support[1] + 1e-12)
@@ -335,6 +395,9 @@ def _run_fused(
         num_phases=1 if dense_single_stream else config.num_phases,
         consensus=consensus,
         uncertainty_penalty=uncertainty_penalty,
+        relevance_weight=relevance_weight,
+        phase_vote_weight=phase_vote_weight,
+        use_v2_selection=use_v2_selection,
     )
     if dense_single_stream:
         level += round(math.log2(config.num_phases))
@@ -512,6 +575,20 @@ def run_phasefuse_method(
             uncertainty_penalty=0.0,
             dense_single_stream=True,
         )
+    if method == "phasefuse_v2":
+        return _run_fused(
+            record,
+            stable_features,
+            phase_ids,
+            support,
+            config,
+            transform_method="swt",
+            consensus="median",
+            uncertainty_penalty=0.0,
+            relevance_weight=0.0,
+            phase_vote_weight=0.0,
+            use_v2_selection=True,
+        )
     return _run_fused(
         record,
         stable_features,
@@ -611,6 +688,11 @@ def save_phasefuse_trace(
         "selected_phase_uncertainty_max",
         "zero_allocation_segments",
         "max_boundary_count",
+        "selection_strategy",
+        "component_scaling",
+        "uniform_reserve",
+        "selection_event_weight",
+        "min_selection_distance_sec",
     ):
         if name in metadata:
             row[name] = metadata[name]
@@ -738,6 +820,7 @@ def load_phasefuse_config(path: str | Path) -> PhaseFuseFileConfig:
 
 
 __all__ = [
+    "PHASEFUSE_DEFAULT_METHODS",
     "PHASEFUSE_METHODS",
     "PhaseFuseExperimentConfig",
     "PhaseFuseFileConfig",
