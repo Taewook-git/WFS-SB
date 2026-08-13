@@ -87,8 +87,8 @@ def _arm(row: Mapping[str, Any]) -> CanonicalArmRequest:
         primary_sources = ("canonical_uniform_anchor",) * len(targets)
         anchor_indices = set(indices)
     elif method in {"phasefuse_rc12", "phasefuse_rc14"}:
-        role = "rc12"
         label = method.removeprefix("phasefuse_")
+        role = label
         decision = row.get("decision_metadata")
         if not isinstance(decision, Mapping):
             raise ValueError("RC12 decision_metadata is missing")
@@ -368,6 +368,7 @@ def main() -> None:
     traces, summary = decode_decisions(
         decisions, treatment_method=args.treatment_method
     )
+    paired_traces = list(traces)
     input_paths = [args.decisions]
     if args.treatment_only:
         if args.reference_uniform_traces is None:
@@ -383,6 +384,11 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trace_path = args.output_dir / "traces.jsonl"
     write_jsonl(trace_path, traces)
+    if args.treatment_only:
+        paired_trace_path = args.output_dir / "paired_traces.jsonl"
+        write_jsonl(paired_trace_path, paired_traces)
+        summary["paired_traces"] = str(paired_trace_path.resolve())
+        summary["paired_traces_sha256"] = sha256_file(paired_trace_path)
     summary_path = args.output_dir / "decode_summary.json"
     temporary = summary_path.with_suffix(".json.tmp")
     temporary.write_text(

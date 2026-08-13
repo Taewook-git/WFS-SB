@@ -36,6 +36,7 @@ RC12_PREDICTIONS="${RC12_RUN_DIR}/predictions.jsonl"
 RC12_VALIDATION="${RC12_RUN_DIR}/validation.json"
 DECISIONS="${RUN_DIR}/decisions/decisions.jsonl"
 TRACES="${RUN_DIR}/exact_decode/traces.jsonl"
+PAIRED_TRACES="${RUN_DIR}/exact_decode/paired_traces.jsonl"
 DECODE_SUMMARY="${RUN_DIR}/exact_decode/decode_summary.json"
 KEYFRAMES="${RUN_DIR}/keyframes"
 VALIDATION="${RUN_DIR}/validation.json"
@@ -57,18 +58,8 @@ PYTHONPATH=. "${PYTHON_BIN}" scripts/decode_rc12_exact.py \
   --decisions "${DECISIONS}" --output-dir "${RUN_DIR}/exact_decode" \
   --treatment-method phasefuse_rc14 --treatment-only \
   --reference-uniform-traces "${RC12_TRACES}"
-"${PYTHON_BIN}" - "${RC12_TRACES}" "${TRACES}" "${RUN_DIR}/paired_traces.jsonl" <<'PY'
-import json,sys
-rows=[]
-for path in sys.argv[1:3]:
-    for line in open(path):
-        row=json.loads(line)
-        if row['method'] in {'canonical_uniform','phasefuse_rc14'}: rows.append(row)
-rows.sort(key=lambda r:(r['dataset'],r['video_id'],r['question_id'],int(r['origin_id']),r['method']))
-open(sys.argv[3],'w').writelines(json.dumps(row,sort_keys=True)+'\n' for row in rows)
-PY
 PYTHONPATH=. "${PYTHON_BIN}" -m phase_stable analyze-phasefuse \
-  --traces "${RUN_DIR}/paired_traces.jsonl" \
+  --traces "${PAIRED_TRACES}" \
   --output "${RUN_DIR}/selector_analysis_summary.json" \
   --baseline-method canonical_uniform --treatment-method phasefuse_rc14 \
   --n-bootstrap 10000 --seed 20260813
@@ -79,6 +70,7 @@ PYTHONPATH=. "${PYTHON_BIN}" -m phase_stable export-keyframes \
   --expected-budget 16 --allow-annotation-subset
 PYTHONPATH=. "${PYTHON_BIN}" scripts/validate_rc14_exact_artifacts.py \
   --decisions "${DECISIONS}" --traces "${TRACES}" \
+  --paired-traces "${PAIRED_TRACES}" \
   --decode-summary "${DECODE_SUMMARY}" --keyframes "${KEYFRAMES}" \
   --source-video-bundle "${SOURCE_BUNDLE}" \
   --reference-decisions "${RC12_DECISIONS}" \

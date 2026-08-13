@@ -212,6 +212,33 @@ def validate_traces(
     )
 
 
+def validate_paired_traces(paired: list[dict], treatment: list[dict]) -> dict:
+    paired_map = {key(row): row for row in paired}
+    treatment_map = {key(row): row for row in treatment}
+    if len(paired) != 600 or len(paired_map) != 600:
+        raise SystemExit("RC14 paired trace grid is not unique 60x5x2")
+    if {row["method"] for row in paired} != {
+        "canonical_uniform",
+        "phasefuse_rc14",
+    }:
+        raise SystemExit("RC14 paired trace methods drift")
+    if any(paired_map[logical_key] != row for logical_key, row in treatment_map.items()):
+        raise SystemExit("treatment-only traces differ from paired decode traces")
+    union_fields = (
+        "timestamps_sec",
+        "actual_pts_sec",
+        "source_frame_indices",
+        "pixel_hashes",
+        "candidate_provenance",
+    )
+    for item in {logical_key[:4] for logical_key in paired_map}:
+        uniform = paired_map[(*item, "canonical_uniform")]
+        treatment_row = paired_map[(*item, "phasefuse_rc14")]
+        if any(uniform.get(field) != treatment_row.get(field) for field in union_fields):
+            raise SystemExit(f"RC14 pair candidate union drift: {item}")
+    return {"num_rows": 600, "candidate_union_exact_alignment": True}
+
+
 def audit_pixels(by_video: dict[str, list[tuple[list[int], list[str]]]]) -> dict:
     logical = unique = 0
     for video_path, entries in sorted(by_video.items()):
@@ -296,6 +323,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--decisions", type=Path, required=True)
     parser.add_argument("--traces", type=Path, required=True)
+    parser.add_argument("--paired-traces", type=Path, required=True)
     parser.add_argument("--decode-summary", type=Path, required=True)
     parser.add_argument("--keyframes", type=Path, required=True)
     parser.add_argument("--source-video-bundle", type=Path, required=True)
@@ -308,6 +336,7 @@ def main() -> None:
     decisions = read_rows(args.decisions)
     reference_decisions = read_rows(args.reference_decisions)
     traces = read_rows(args.traces)
+    paired_traces = read_rows(args.paired_traces)
     decode_summary = json.loads(args.decode_summary.read_text())
     decision_audit = validate_decisions(decisions, reference_decisions)
     source_audit = validate_sources(args.source_video_bundle, decisions)
@@ -321,10 +350,12 @@ def main() -> None:
         "fresh_source_decode": True,
         "decisions_sha256": sha(args.decisions),
         "traces_sha256": sha(args.traces),
+        "paired_traces_sha256": sha(args.paired_traces),
         "decode_summary_sha256": sha(args.decode_summary),
         "source_video_bundle": source_audit,
         "decision_audit": decision_audit,
         "trace_audit": trace_audit,
+        "paired_trace_audit": validate_paired_traces(paired_traces, traces),
         "qwen_frame_index_pixel_hash_roundtrip": audit_pixels(by_video),
         "keyframe_bundle": audit_keyframes(
             args.keyframes, trace_map, args.reference_keyframes

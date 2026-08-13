@@ -376,3 +376,26 @@ def test_video_batch_rejects_any_cross_request_canonical_lattice_drift():
         decode_canonical_request_batch("drift.mp4", requests, decoder=decoder)
 
     assert decoder.calls == []
+
+
+def test_rc14_role_uses_same_exact_contract_with_truthful_provenance():
+    lattice = tuple(map(float, range(20)))
+    pair = CanonicalRequestPair(
+        "rc14/o0",
+        _arm("rc14", lattice[:16], lattice, method="phasefuse_rc14"),
+        _arm(
+            "canonical_uniform",
+            lattice[:16],
+            lattice,
+            method="canonical_uniform",
+        ),
+    )
+    result = decode_canonical_request_batch(
+        "rc14.mp4", (pair,), decoder=SyntheticVFRDecoder(lattice)
+    ).request("rc14/o0")
+
+    assert result.arm("phasefuse_rc14").role == "rc14"
+    assert all(
+        attempt.role == "rc14"
+        for attempt in result.arm("phasefuse_rc14").attempts
+    )
