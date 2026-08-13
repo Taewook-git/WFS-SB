@@ -195,6 +195,19 @@ def test_method_subset_and_config_validation(tmp_path: Path):
     assert file_config.experiment.uniform_reserve == 8
     assert file_config.metadata["main_method"] == "phasefuse_v2"
 
+    ablation_config = load_phasefuse_config(
+        Path(__file__).parents[1]
+        / "configs"
+        / "phasefuse_v2_selector_ablation_dev20.yaml"
+    )
+    assert ablation_config.experiment.methods == (
+        "phase0_swt_v2_selector",
+        "dense_swt_v2_selector",
+        "phasefuse_v2",
+    )
+    assert ablation_config.metadata["baseline_method"] == "phase0_swt_v2_selector"
+    assert ablation_config.metadata["status"] == "frozen_selector_only_ablation"
+
 
 def test_phasefuse_v2_is_global_four_phase_median_and_keeps_v1_unchanged(
     tmp_path: Path,
@@ -246,6 +259,129 @@ def test_phasefuse_v2_is_global_four_phase_median_and_keeps_v1_unchanged(
             methods=("phasefuse_v2",),
             num_phases=2,
         )
+
+
+def test_phase0_swt_v2_matches_global_selector_and_only_disables_phase_fusion(
+    tmp_path: Path,
+):
+    records = _records(tmp_path)
+    config = PhaseFuseExperimentConfig(
+        methods=("phase0_swt_v2_selector", "phasefuse_v2"),
+        frame_budget=8,
+        min_frames_per_segment=2,
+        uniform_reserve=4,
+        selection_event_weight=0.25,
+        component_scaling="percentile",
+        min_selection_distance_sec=0.5,
+    )
+    rows = run_phasefuse_experiment(records, tmp_path / "matched_v2", config=config)
+    assert len(rows) == 4
+    by_method = {row["method"]: row for row in rows if row["origin_id"] == 0}
+    single = by_method["phase0_swt_v2_selector"]
+    fused = by_method["phasefuse_v2"]
+
+    assert single["timestamps_sec"] == fused["timestamps_sec"]
+    assert single["source_frame_indices"] == fused["source_frame_indices"]
+    assert len(single["selected_indices"]) == len(fused["selected_indices"]) == 8
+    assert single["peaks"] == fused["peaks"] == []
+    assert single["allocation"] == fused["allocation"] == {"0": 8}
+
+    single_metadata = single["method_metadata"]
+    fused_metadata = fused["method_metadata"]
+    assert single_metadata["selector_kind"] == (
+        "single_physical_phase_global_coverage"
+    )
+    assert single_metadata["ablation"] == "phase_marginalization_only_control"
+    assert single_metadata["phase_marginalization"] == "disabled_phase0_only"
+    assert single_metadata["physical_phase_ids_used"] == [0]
+    assert single_metadata["candidate_grid"] == "shared_dense_common_support"
+    assert single_metadata["preselection_transform"]["method"] == "swt"
+
+    single_config = single_metadata["phasefuse"]["config"]
+    fused_config = fused_metadata["phasefuse"]["config"]
+    for field in (
+        "frame_budget",
+        "selection_strategy",
+        "uniform_reserve",
+        "selection_event_weight",
+        "component_scaling",
+        "min_selection_distance_sec",
+        "uncertainty_penalty",
+        "relevance_weight",
+        "phase_vote_weight",
+        "mmr_lambda",
+        "mmr_visual_weight",
+        "temporal_redundancy_scale_sec",
+    ):
+        assert single_config[field] == fused_config[field]
+    assert single_config["num_phases"] == 1
+    assert fused_config["num_phases"] == 4
+
+    with np.load(single["array_path"], allow_pickle=False) as arrays:
+        assert arrays["single_phase_dense_indices"].ndim == 1
+        assert arrays["single_phase_aligned_saliency"].shape == (
+            len(single["timestamps_sec"]),
+        )
+        assert arrays["single_phase_aligned_support"].dtype == np.bool_
+
+    comparison = evaluate_phasefuse_analysis(
+        rows,
+        baseline_method="phase0_swt_v2_selector",
+        treatment_method="phasefuse_v2",
+        n_bootstrap=25,
+        seed=4,
+    )
+    assert comparison["baseline_method"] == "phase0_swt_v2_selector"
+    assert comparison["treatment_method"] == "phasefuse_v2"
+    assert comparison["num_paired_items"] == 1
+    assert comparison["comparison"]["effect_definition"] == "treatment - baseline"
+    assert comparison["comparison"]["n_clusters"] == 1
+
+
+def test_dense_swt_v2_uses_same_selector_without_phase_marginalization(
+    tmp_path: Path,
+):
+    records = _records(tmp_path)
+    config = PhaseFuseExperimentConfig(
+        methods=("dense_swt_v2_selector", "phasefuse_v2"),
+        frame_budget=8,
+        min_frames_per_segment=2,
+        uniform_reserve=4,
+        selection_event_weight=0.25,
+        component_scaling="percentile",
+        min_selection_distance_sec=0.5,
+    )
+    rows = run_phasefuse_experiment(records, tmp_path / "dense_control", config=config)
+    by_method = {row["method"]: row for row in rows if row["origin_id"] == 0}
+    dense = by_method["dense_swt_v2_selector"]
+    fused = by_method["phasefuse_v2"]
+    metadata = dense["method_metadata"]
+    assert metadata["selector_kind"] == "direct_dense_single_stream"
+    assert metadata["ablation"] == "phase_marginalization_only_control"
+    assert metadata["phase_marginalization"] == "disabled_dense_single_stream"
+    assert metadata["physical_phase_ids_used"] == [0, 1, 2, 3]
+    assert metadata["preselection_transform"] == "direct_dense_4fps_swt"
+    assert dense["peaks"] == fused["peaks"] == []
+    assert dense["allocation"] == fused["allocation"] == {"0": 8}
+    dense_config = metadata["phasefuse"]["config"]
+    fused_config = fused["method_metadata"]["phasefuse"]["config"]
+    for field in (
+        "frame_budget",
+        "selection_strategy",
+        "uniform_reserve",
+        "selection_event_weight",
+        "component_scaling",
+        "min_selection_distance_sec",
+        "uncertainty_penalty",
+        "relevance_weight",
+        "phase_vote_weight",
+        "mmr_lambda",
+        "mmr_visual_weight",
+        "temporal_redundancy_scale_sec",
+    ):
+        assert dense_config[field] == fused_config[field]
+    assert dense_config["num_phases"] == 1
+    assert fused_config["num_phases"] == 4
 
 
 def test_dense_feature_provenance_rejects_post_record_tampering(tmp_path: Path):

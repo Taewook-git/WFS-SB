@@ -18,6 +18,7 @@ from .artifacts import OriginSignalRecord, artifact_id, write_jsonl
 from .phasefuse import (
     PhaseFuseConfig,
     PhaseFuseTrace,
+    align_phase_values,
     run_phasefuse,
     select_mmr_indices,
 )
@@ -35,7 +36,12 @@ PHASEFUSE_DEFAULT_METHODS = (
     "dense_swt",
     "phasefuse",
 )
-PHASEFUSE_METHODS = (*PHASEFUSE_DEFAULT_METHODS, "phasefuse_v2")
+PHASEFUSE_METHODS = (
+    *PHASEFUSE_DEFAULT_METHODS,
+    "phase0_swt_v2_selector",
+    "dense_swt_v2_selector",
+    "phasefuse_v2",
+)
 
 
 @dataclass(frozen=True)
@@ -119,15 +125,20 @@ class PhaseFuseExperimentConfig:
             )
         if self.component_scaling not in {"robust_z", "percentile"}:
             raise ValueError("component_scaling must be 'robust_z' or 'percentile'")
-        if "phasefuse_v2" in methods:
-            if self.num_phases != 4:
-                raise ValueError("phasefuse_v2 requires exactly four physical phases")
+        v2_selector_methods = {
+            "phase0_swt_v2_selector",
+            "dense_swt_v2_selector",
+            "phasefuse_v2",
+        }
+        if v2_selector_methods.intersection(methods):
             if self.selection_strategy != "global_coverage":
-                raise ValueError("phasefuse_v2 requires global_coverage selection")
+                raise ValueError("v2 selector arms require global_coverage selection")
             if self.uniform_reserve > self.frame_budget:
                 raise ValueError(
-                    "phasefuse_v2 uniform_reserve cannot exceed frame_budget"
+                    "v2 selector uniform_reserve cannot exceed frame_budget"
                 )
+        if "phasefuse_v2" in methods and self.num_phases != 4:
+            raise ValueError("phasefuse_v2 requires exactly four physical phases")
         numeric = (
             "min_boundary_distance_sec",
             "boundary_threshold_mad",
@@ -372,6 +383,121 @@ def _phasefuse_result(trace: PhaseFuseTrace, *, kind: str) -> _SelectionResult:
     )
 
 
+class _PrecomputedSaliencyTransform:
+    """Expose one already aligned physical-phase SWT signal to the v2 selector."""
+
+    def __init__(self, saliency: np.ndarray, *, method: str) -> None:
+        self.saliency = np.asarray(saliency, dtype=float)
+        self.method = method
+
+    def transform(self, signal: Sequence[float]) -> Any:
+        values = np.asarray(signal, dtype=float)
+        if values.shape != self.saliency.shape:
+            raise ValueError("precomputed saliency must align with the selector grid")
+        return type(
+            "PrecomputedSaliencyResult",
+            (),
+            {"method": self.method, "saliency": self.saliency.copy()},
+        )()
+
+
+def _run_phase0_swt_v2_selector(
+    record: OriginSignalRecord,
+    features: np.ndarray,
+    phase_ids: np.ndarray,
+    support: np.ndarray,
+    config: PhaseFuseExperimentConfig,
+) -> _SelectionResult:
+    """Run the v2 selector on phase-0 SWT saliency over the shared dense grid.
+
+    The transform sees only physical phase 0 at the base sampling rate.  Its
+    saliency is linearly aligned back to the original dense timestamps before
+    the exact PhaseFuse-v2 global-coverage selector is applied.  Consequently
+    this control changes phase marginalization only: frame budget, dense
+    candidate grid, common support, relevance/features, anchors, scaling, MMR,
+    and minimum-distance policy are all shared with ``phasefuse_v2``.
+    """
+
+    timestamps = np.asarray(record.timestamps_sec, dtype=float)
+    relevance = np.asarray(record.relevance_scores, dtype=float)
+    phase_zero = np.flatnonzero(phase_ids == 0)
+    if phase_zero.size < 2:
+        raise ValueError(
+            "phase0_swt_v2_selector requires at least two phase-0 samples"
+        )
+    level = _phase_level(phase_zero.size, config)
+    swt = build_transform(_transform_config("swt", level, config))
+    swt_result = swt.transform(relevance[phase_zero])
+    aligned, aligned_support = align_phase_values(
+        timestamps,
+        (phase_zero,),
+        (np.asarray(swt_result.saliency, dtype=float),),
+    )
+    common_valid = (
+        (timestamps >= support[0] - 1e-12)
+        & (timestamps <= support[1] + 1e-12)
+        & aligned_support[0]
+    )
+    precomputed_saliency = np.nan_to_num(aligned[0], nan=0.0)
+    selector_config = config.selector_config(
+        num_phases=1,
+        consensus="median",
+        uncertainty_penalty=0.0,
+        relevance_weight=0.0,
+        phase_vote_weight=0.0,
+        use_v2_selection=True,
+    )
+    trace = run_phasefuse(
+        timestamps,
+        relevance,
+        features,
+        config=selector_config,
+        transform=_PrecomputedSaliencyTransform(
+            precomputed_saliency,
+            method="single_physical_phase_swt_aligned",
+        ),
+        phase_ids=np.zeros(timestamps.size, dtype=int),
+        valid_mask=common_valid,
+        source_frame_indices=record.source_frame_indices,
+    )
+    result = _phasefuse_result(
+        trace,
+        kind="single_physical_phase_global_coverage",
+    )
+    metadata = dict(result.metadata)
+    metadata.update(
+        {
+            "ablation": "phase_marginalization_only_control",
+            "phase_marginalization": "disabled_phase0_only",
+            "physical_phase_ids_used": [0],
+            "physical_phase_candidate_count": int(phase_zero.size),
+            "candidate_grid": "shared_dense_common_support",
+            "preselection_transform": swt_result.summary(),
+        }
+    )
+    arrays = dict(result.dense_arrays)
+    arrays.update(
+        {
+            "single_phase_swt_saliency": np.asarray(
+                swt_result.saliency, dtype=float
+            ),
+            "single_phase_aligned_saliency": precomputed_saliency,
+            "single_phase_aligned_support": aligned_support[0],
+            "single_phase_dense_indices": phase_zero,
+        }
+    )
+    return _SelectionResult(
+        selected_indices=result.selected_indices,
+        boundary_indices=result.boundary_indices,
+        segments=result.segments,
+        allocation=result.allocation,
+        used_fallback=result.used_fallback,
+        fallback_reason=result.fallback_reason,
+        metadata=metadata,
+        dense_arrays=arrays,
+    )
+
+
 def _run_fused(
     record: OriginSignalRecord,
     features: np.ndarray,
@@ -574,6 +700,48 @@ def run_phasefuse_method(
             transform_method="swt",
             uncertainty_penalty=0.0,
             dense_single_stream=True,
+        )
+    if method == "phase0_swt_v2_selector":
+        return _run_phase0_swt_v2_selector(
+            record,
+            stable_features,
+            phase_ids,
+            support,
+            config,
+        )
+    if method == "dense_swt_v2_selector":
+        result = _run_fused(
+            record,
+            stable_features,
+            phase_ids,
+            support,
+            config,
+            transform_method="swt",
+            uncertainty_penalty=0.0,
+            relevance_weight=0.0,
+            phase_vote_weight=0.0,
+            dense_single_stream=True,
+            use_v2_selection=True,
+        )
+        metadata = dict(result.metadata)
+        metadata.update(
+            {
+                "ablation": "phase_marginalization_only_control",
+                "phase_marginalization": "disabled_dense_single_stream",
+                "physical_phase_ids_used": [0, 1, 2, 3],
+                "candidate_grid": "shared_dense_common_support",
+                "preselection_transform": "direct_dense_4fps_swt",
+            }
+        )
+        return _SelectionResult(
+            selected_indices=result.selected_indices,
+            boundary_indices=result.boundary_indices,
+            segments=result.segments,
+            allocation=result.allocation,
+            used_fallback=result.used_fallback,
+            fallback_reason=result.fallback_reason,
+            metadata=metadata,
+            dense_arrays=result.dense_arrays,
         )
     if method == "phasefuse_v2":
         return _run_fused(
