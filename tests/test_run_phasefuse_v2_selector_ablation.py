@@ -65,6 +65,8 @@ def test_selector_ablation_runner_is_isolated_matched_and_provenance_safe() -> N
     assert "trace array failed authentication" in source
     assert "exact sorted K=16" in source
     assert "phase_marginalization_only_control" in source
+    assert "PREFLIGHT: fingerprint=" in source
+    assert "PREFLIGHT: rows=900" in source
     assert "run_mllm_grid.sh" not in source
     assert "lmms_eval" not in source
     assert "export-keyframes" not in source

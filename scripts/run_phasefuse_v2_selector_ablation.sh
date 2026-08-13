@@ -217,6 +217,11 @@ TRACE_BUNDLE="${SELECTION_DIR}/trace_array_bundle.jsonl"
 RUN_MANIFEST="${SELECTION_DIR}/manifest/run_manifest.json"
 ENVIRONMENT="${SELECTION_DIR}/manifest/environment.json"
 
+printf 'PREFLIGHT: fingerprint=%s\n' "${FINGERPRINT}"
+printf 'PREFLIGHT: source_sha256=%s config_sha256=%s base_signals_sha256=%s\n' \
+  "${SOURCE_SHA}" "${CONTRACT[4]}" "${CONTRACT[2]}"
+printf 'PREFLIGHT: rows=900 methods=phase0_swt_v2_selector,dense_swt_v2_selector,phasefuse_v2 K=16 origins=0..4 clusters=20\n'
+
 if ((FORCE == 0)) && valid_marker "${MARKER}" "${FINGERPRINT}" "${TRACES}" "${SUMMARY}" "${PHASE0_ANALYSIS}" "${DENSE_ANALYSIS}" "${TRACE_BUNDLE}" "${RUN_MANIFEST}" "${ENVIRONMENT}"; then
   printf 'SKIP: matched-selector dev20 ablation already complete\n'
   exit 0
