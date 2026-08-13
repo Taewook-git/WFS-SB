@@ -18,6 +18,11 @@ def test_qwen_launcher_is_approval_gated_locked_and_runs_ten_cells():
     assert "run_mllm_grid.sh" not in runner
     assert '[[ "${APPROVED}" == "RC12_DEV20_QWEN" ]]' in launcher
     assert ".rc12_qwen.lock" in launcher and "flock -n 9" in launcher
+    assert '--evaluation-root) EVALUATION_ROOT=' in launcher
+    assert 'EVALUATION_DATA_ROOT="${EVALUATION_ROOT}/datasets/videomme/data"' in launcher
+    assert "source member is not bound to evaluation dataset root" in launcher
+    assert '--repo-root "${EVALUATION_ROOT}"' in launcher
+    assert '"evaluation_root":evaluation_root' in launcher
     assert "--methods canonical_uniform,phasefuse_rc12 --origins 0,1,2,3,4" in launcher
     assert '"independent_cells":10' in launcher
     assert '"uniform_inference_reused":False' in launcher
