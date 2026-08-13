@@ -83,8 +83,10 @@ def test_all_phasefuse_arms_share_candidates_and_emit_exact_source_budget(
     assert "phasefuse_v2" not in config.methods
     assert "canonical_uniform" not in PHASEFUSE_METHODS
     assert "phasefuse_rc12" not in PHASEFUSE_METHODS
+    assert "phasefuse_rc14" not in PHASEFUSE_METHODS
     assert "canonical_uniform" in PHASEFUSE_ANALYSIS_METHODS
     assert "phasefuse_rc12" in PHASEFUSE_ANALYSIS_METHODS
+    assert "phasefuse_rc14" in PHASEFUSE_ANALYSIS_METHODS
     assert len(rows) == len(records) * len(config.methods)
     assert list(iter_jsonl(tmp_path / "run" / "traces.jsonl")) == rows
     for row in rows:

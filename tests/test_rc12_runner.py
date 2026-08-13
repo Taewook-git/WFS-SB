@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from scripts.evaluate_rc12_gate import evaluate_gate
+from scripts.evaluate_canonical_gate import evaluate_gate as evaluate_canonical_gate
 
 ROOT = Path(__file__).parents[1]
 
@@ -37,6 +38,41 @@ def test_qwen_launcher_is_approval_gated_locked_and_runs_ten_cells():
         "source member drift",
     ):
         assert token in launcher
+
+
+def test_rc14_launcher_is_five_cell_reuse_gated_and_frozen():
+    launcher = (ROOT / "scripts/launch_rc14_qwen_approved.sh").read_text()
+    assert '[[ "${APPROVED}" == "RC14_DEV20_QWEN" ]]' in launcher
+    assert ".rc14_qwen.lock" in launcher and "flock -n 9" in launcher
+    assert "--methods phasefuse_rc14 --origins 0,1,2,3,4" in launcher
+    assert "--repo-root \"${EVALUATION_ROOT}\"" in launcher
+    assert "canonical_uniform_inference_reused" in launcher
+    assert "uniform prediction reuse drift" in launcher
+    assert "logical_selected_hash_comparisons']==4800" in launcher
+
+
+def test_generic_canonical_gate_supports_rc14_and_strict_boundaries():
+    def summary(low=-0.029, high=0.029):
+        return {
+            "stability": {
+                "baseline_method": "canonical_uniform",
+                "treatment_method": "phasefuse_rc14",
+                "comparison": {
+                    "effect_definition": "treatment - baseline",
+                    "effect_order": [
+                        "delta_mean_accuracy",
+                        "delta_pairwise_answer_disagreement",
+                    ],
+                    "estimate": [0.0, 0.0],
+                    "ci_low": [low, -0.01],
+                    "ci_high": [0.02, high],
+                },
+            }
+        }
+
+    assert evaluate_canonical_gate(summary(), "phasefuse_rc14")["status"] == "pass"
+    assert evaluate_canonical_gate(summary(low=-0.03), "phasefuse_rc14")["status"] == "fail"
+    assert evaluate_canonical_gate(summary(high=0.03), "phasefuse_rc14")["status"] == "fail"
 
 
 def _prediction(method: str, origin: int, video: str, question: str):

@@ -20,7 +20,7 @@ from phase_stable.canonical_resample import (
 )
 
 from phase_stable.artifacts import write_jsonl
-from phase_stable.repro import write_reproducibility_manifests
+from phase_stable.repro import sha256_file, write_reproducibility_manifests
 
 METHODS = ("canonical_uniform", "phasefuse_rc12")
 
@@ -86,8 +86,9 @@ def _arm(row: Mapping[str, Any]) -> CanonicalArmRequest:
         role = "canonical_uniform"
         primary_sources = ("canonical_uniform_anchor",) * len(targets)
         anchor_indices = set(indices)
-    elif method == "phasefuse_rc12":
+    elif method in {"phasefuse_rc12", "phasefuse_rc14"}:
         role = "rc12"
+        label = method.removeprefix("phasefuse_")
         decision = row.get("decision_metadata")
         if not isinstance(decision, Mapping):
             raise ValueError("RC12 decision_metadata is missing")
@@ -96,7 +97,7 @@ def _arm(row: Mapping[str, Any]) -> CanonicalArmRequest:
         if anchors | residuals != set(indices) or anchors & residuals:
             raise ValueError("RC12 anchor/residual provenance does not match targets")
         primary_sources = tuple(
-            "rc12_anchor" if index in anchors else "rc12_query_residual"
+            f"{label}_anchor" if index in anchors else f"{label}_query_residual"
             for index in indices
         )
         anchor_indices = anchors
@@ -107,9 +108,9 @@ def _arm(row: Mapping[str, Any]) -> CanonicalArmRequest:
         (
             "canonical_uniform_anchor_candidate"
             if role == "canonical_uniform"
-            else "rc12_anchor_candidate"
+            else f"{label}_anchor_candidate"
             if index in anchor_indices
-            else "rc12_query_residual_candidate"
+            else f"{label}_query_residual_candidate"
         )
         for index in range(len(lattice))
     )
@@ -128,14 +129,19 @@ def _arm(row: Mapping[str, Any]) -> CanonicalArmRequest:
 
 def build_request_pairs(
     decisions: Iterable[Mapping[str, Any]],
+    *,
+    treatment_method: str = "phasefuse_rc12",
 ) -> tuple[dict[str, list[CanonicalRequestPair]], dict[str, dict[str, Any]]]:
+    if treatment_method not in {"phasefuse_rc12", "phasefuse_rc14"}:
+        raise ValueError("unsupported canonical residual treatment method")
+    methods = ("canonical_uniform", treatment_method)
     cells: dict[tuple[str, str, str, int], dict[str, Mapping[str, Any]]] = defaultdict(
         dict
     )
     for row in decisions:
         key = _logical_key(row)
         method = str(row.get("method"))
-        if method not in METHODS or method in cells[key]:
+        if method not in methods or method in cells[key]:
             raise ValueError(f"invalid or duplicate method for decision cell {key}")
         cells[key][method] = row
 
@@ -143,10 +149,10 @@ def build_request_pairs(
     video_contracts: dict[str, tuple[str, float, float, tuple[float, ...]]] = {}
     metadata_by_request: dict[str, dict[str, Any]] = {}
     for key, arms in sorted(cells.items()):
-        if set(arms) != set(METHODS):
+        if set(arms) != set(methods):
             raise ValueError(f"decision cell does not contain both frozen arms: {key}")
         uniform = arms["canonical_uniform"]
-        rc12 = arms["phasefuse_rc12"]
+        treatment = arms[treatment_method]
         contract_fields = (
             "video_path",
             "origin_sec",
@@ -154,20 +160,20 @@ def build_request_pairs(
             "support_stop_sec",
             "lattice_timestamps_sec",
         )
-        if any(uniform.get(name) != rc12.get(name) for name in contract_fields):
+        if any(uniform.get(name) != treatment.get(name) for name in contract_fields):
             raise ValueError(f"paired decision contract mismatch: {key}")
         request_id = _request_id(key)
         pair = CanonicalRequestPair(
             request_id=request_id,
-            rc12=_arm(rc12),
+            rc12=_arm(treatment),
             canonical_uniform=_arm(uniform),
         )
-        video_path = str(Path(str(rc12["video_path"])).resolve())
+        video_path = str(Path(str(treatment["video_path"])).resolve())
         video_contract = (
             key[1],
-            float(rc12["support_start_sec"]),
-            float(rc12["support_stop_sec"]),
-            tuple(float(value) for value in rc12["lattice_timestamps_sec"]),
+            float(treatment["support_start_sec"]),
+            float(treatment["support_stop_sec"]),
+            tuple(float(value) for value in treatment["lattice_timestamps_sec"]),
         )
         prior_contract = video_contracts.setdefault(video_path, video_contract)
         if prior_contract != video_contract:
@@ -180,13 +186,13 @@ def build_request_pairs(
             "video_id": key[1],
             "question_id": key[2],
             "origin_id": key[3],
-            "origin_sec": float(rc12["origin_sec"]),
-            "record_metadata": dict(rc12.get("record_metadata", {})),
-            "support_start_sec": float(rc12["support_start_sec"]),
-            "support_stop_sec": float(rc12["support_stop_sec"]),
+            "origin_sec": float(treatment["origin_sec"]),
+            "record_metadata": dict(treatment.get("record_metadata", {})),
+            "support_start_sec": float(treatment["support_start_sec"]),
+            "support_stop_sec": float(treatment["support_stop_sec"]),
             "decision_metadata": {
                 method: dict(arms[method].get("decision_metadata", {}))
-                for method in METHODS
+                for method in methods
             },
         }
     for video_path, pairs in pairs_by_video.items():
@@ -208,8 +214,13 @@ def build_request_pairs(
 
 def decode_decisions(
     decisions: Iterable[Mapping[str, Any]],
+    *,
+    treatment_method: str = "phasefuse_rc12",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    pairs_by_video, metadata = build_request_pairs(decisions)
+    methods = ("canonical_uniform", treatment_method)
+    pairs_by_video, metadata = build_request_pairs(
+        decisions, treatment_method=treatment_method
+    )
     traces: list[dict[str, Any]] = []
     video_passes: dict[str, list[dict[str, Any]]] = {}
     for video_path, pairs in sorted(pairs_by_video.items()):
@@ -218,14 +229,16 @@ def decode_decisions(
         for pair in sorted(pairs, key=lambda item: item.request_id):
             context = metadata[pair.request_id]
             decoded = result.request(pair.request_id)
-            for method in METHODS:
+            for method in methods:
                 record_metadata = {
                     **context["record_metadata"],
                     "canonical_support_sec": [
                         context["support_start_sec"],
                         context["support_stop_sec"],
                     ],
-                    "rc12_decision": context["decision_metadata"][method],
+                    f"{treatment_method.removeprefix('phasefuse_')}_decision": context[
+                        "decision_metadata"
+                    ][method],
                 }
                 traces.append(
                     decoded.trace_row(
@@ -249,7 +262,7 @@ def decode_decisions(
     )
     summary = {
         "schema_version": 1,
-        "methods": list(METHODS),
+        "methods": list(methods),
         "num_rows": len(traces),
         "num_videos": len(pairs_by_video),
         "video_decode_passes": video_passes,
@@ -291,13 +304,82 @@ def decode_decisions(
     return traces, summary
 
 
+def audit_uniform_reuse(
+    fresh_traces: Iterable[Mapping[str, Any]],
+    reference_path: Path,
+) -> dict[str, Any]:
+    def key(row: Mapping[str, Any]) -> tuple[str, str, str, int]:
+        return (
+            str(row["dataset"]),
+            str(row["video_id"]),
+            str(row["question_id"]),
+            int(row["origin_id"]),
+        )
+
+    reference = [
+        row
+        for row in _read_rows(reference_path)
+        if row.get("method") == "canonical_uniform"
+    ]
+    fresh = [row for row in fresh_traces if row.get("method") == "canonical_uniform"]
+    reference_map = {key(row): row for row in reference}
+    fresh_map = {key(row): row for row in fresh}
+    if len(reference_map) != 300 or set(reference_map) != set(fresh_map):
+        raise ValueError("canonical-uniform reference grid is not exact 60x5")
+    fields = (
+        "selected_timestamps_sec",
+        "selected_actual_pts_sec",
+        "selected_source_frame_indices",
+        "selected_pixel_hashes",
+    )
+    payload = []
+    for logical_key in sorted(reference_map):
+        expected = reference_map[logical_key]
+        actual = fresh_map[logical_key]
+        if any(actual.get(field) != expected.get(field) for field in fields):
+            raise ValueError(f"canonical-uniform fresh payload drift: {logical_key}")
+        payload.append([list(logical_key), {field: actual[field] for field in fields}])
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "status": "exact_match",
+        "num_rows": 300,
+        "fields": list(fields),
+        "payload_sha256": digest,
+        "reference_traces": str(reference_path.resolve()),
+        "reference_traces_sha256": sha256_file(reference_path),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--decisions", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--treatment-method",
+        choices=("phasefuse_rc12", "phasefuse_rc14"),
+        default="phasefuse_rc12",
+    )
+    parser.add_argument("--treatment-only", action="store_true")
+    parser.add_argument("--reference-uniform-traces", type=Path)
     args = parser.parse_args()
     decisions = _read_rows(args.decisions)
-    traces, summary = decode_decisions(decisions)
+    traces, summary = decode_decisions(
+        decisions, treatment_method=args.treatment_method
+    )
+    input_paths = [args.decisions]
+    if args.treatment_only:
+        if args.reference_uniform_traces is None:
+            parser.error("--treatment-only requires --reference-uniform-traces")
+        summary["canonical_uniform_reuse_proof"] = audit_uniform_reuse(
+            traces, args.reference_uniform_traces
+        )
+        input_paths.append(args.reference_uniform_traces)
+        traces = [row for row in traces if row["method"] == args.treatment_method]
+        summary["paired_decode_num_rows"] = summary["num_rows"]
+        summary["num_rows"] = len(traces)
+        summary["methods"] = [args.treatment_method]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trace_path = args.output_dir / "traces.jsonl"
     write_jsonl(trace_path, traces)
@@ -309,9 +391,9 @@ def main() -> None:
     os.replace(temporary, summary_path)
     write_reproducibility_manifests(
         args.output_dir,
-        command="decode-rc12-exact",
-        config={"methods": list(METHODS), "frame_budget": 16},
-        input_paths=(args.decisions,),
+        command=f"decode-{args.treatment_method}-exact",
+        config={"methods": summary["methods"], "frame_budget": 16},
+        input_paths=tuple(input_paths),
         extra={"traces": str(trace_path.resolve())},
         repo_root=Path(__file__).parents[1],
     )

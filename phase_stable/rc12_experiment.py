@@ -113,10 +113,18 @@ def build_decision_specs(
     video_contracts: Mapping[str, Mapping[str, Any]],
     *,
     config: RC12Config | None = None,
+    treatment_method: str = "phasefuse_rc12",
 ) -> list[dict[str, Any]]:
     """Build target-only decisions; no scout actual PTS enter the output."""
 
     resolved = config or RC12Config()
+    expected_anchors = {"phasefuse_rc12": 12, "phasefuse_rc14": 14}
+    if treatment_method not in expected_anchors:
+        raise ValueError("treatment_method must be phasefuse_rc12 or phasefuse_rc14")
+    if resolved.anchor_count != expected_anchors[treatment_method]:
+        raise ValueError(
+            f"{treatment_method} requires anchor_count={expected_anchors[treatment_method]}"
+        )
     rows: list[dict[str, Any]] = []
     for item_key, origins in sorted(_group_records(records).items()):
         dataset, video_id, question_id = item_key
@@ -178,7 +186,7 @@ def build_decision_specs(
             rows.append(
                 {
                     **common,
-                    "method": "phasefuse_rc12",
+                    "method": treatment_method,
                     "target_indices": decision.selected_indices.astype(int).tolist(),
                     "target_timestamps_sec": decision.target_timestamps_sec.astype(
                         float
@@ -186,7 +194,10 @@ def build_decision_specs(
                     "quantized_scores": decision.quantized_scores.astype(
                         float
                     ).tolist(),
-                    "decision_metadata": decision.to_dict(include_arrays=False),
+                    "decision_metadata": decision.to_dict(
+                        include_arrays=False,
+                        method="rc14" if treatment_method == "phasefuse_rc14" else "rc12",
+                    ),
                 }
             )
     return rows

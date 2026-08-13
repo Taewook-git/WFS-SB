@@ -85,10 +85,14 @@ class RC12Decision:
     def target_timestamps_sec(self) -> np.ndarray:
         return self.lattice_timestamps_sec[self.selected_indices]
 
-    def to_dict(self, *, include_arrays: bool = False) -> dict[str, Any]:
+    def to_dict(
+        self, *, include_arrays: bool = False, method: str = "rc12"
+    ) -> dict[str, Any]:
+        if method not in {"rc12", "rc14"}:
+            raise ValueError("canonical residual method must be rc12 or rc14")
         payload: dict[str, Any] = {
             "schema_version": 1,
-            "method": "rc12",
+            "method": method,
             "config": asdict(self.config),
             "support_start_sec": float(self.support_start_sec),
             "support_stop_sec": float(self.support_stop_sec),

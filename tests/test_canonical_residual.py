@@ -10,6 +10,25 @@ from phase_stable.canonical_residual import (
 )
 
 
+def test_rc14_is_exact_same_policy_with_fourteen_anchors_two_residuals():
+    timestamps = np.arange(0.0, 40.25, 0.25)
+    relevance = np.sin(timestamps / 3.0) + np.cos(timestamps / 7.0)
+    decision = select_rc12_targets(
+        timestamps,
+        relevance,
+        support_start_sec=1.0,
+        support_stop_sec=39.0,
+        config=RC12Config(anchor_count=14),
+    )
+    assert len(decision.selected_indices) == 16
+    assert len(decision.anchor_indices) == 14
+    assert len(decision.residual_indices) == 2
+    assert decision.to_dict(method="rc14")["method"] == "rc14"
+    assert decision.to_dict(method="rc14")["config"]["anchor_count"] == 14
+    with pytest.raises(ValueError, match="rc12 or rc14"):
+        decision.to_dict(method="unknown")
+
+
 def test_percentile_rank_is_tie_aware_and_constant_safe():
     assert percentile_rank([2.0, 1.0, 1.0, 4.0]).tolist() == pytest.approx(
         [2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0, 1.0]

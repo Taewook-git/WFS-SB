@@ -23,17 +23,28 @@ def main() -> None:
     parser.add_argument("--catalog", type=Path, required=True)
     parser.add_argument("--manifests", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--treatment-method",
+        choices=("phasefuse_rc12", "phasefuse_rc14"),
+        default="phasefuse_rc12",
+    )
+    parser.add_argument("--anchor-count", type=int, default=12)
     args = parser.parse_args()
-    config = RC12Config()
+    config = RC12Config(anchor_count=args.anchor_count)
     records = read_signal_records(args.signals)
     contracts = load_video_contracts(args.catalog, args.manifests)
-    rows = build_decision_specs(records, contracts, config=config)
+    rows = build_decision_specs(
+        records,
+        contracts,
+        config=config,
+        treatment_method=args.treatment_method,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir / "decisions.jsonl"
     save_decision_specs(output, rows)
     summary = {
         "schema_version": 1,
-        "methods": ["canonical_uniform", "phasefuse_rc12"],
+        "methods": ["canonical_uniform", args.treatment_method],
         "num_rows": len(rows),
         "num_items": len(rows) // 10,
         "num_origins": 5,
@@ -47,7 +58,7 @@ def main() -> None:
     )
     write_reproducibility_manifests(
         args.output_dir,
-        command="build-rc12-decisions",
+        command=f"build-{args.treatment_method}-decisions",
         config=summary,
         input_paths=(args.signals, args.catalog, args.manifests),
         extra={"decisions": str(output.resolve())},

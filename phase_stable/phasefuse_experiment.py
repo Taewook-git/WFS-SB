@@ -40,6 +40,7 @@ PHASEFUSE_ANALYSIS_METHODS = (
     *PHASEFUSE_METHODS,
     "canonical_uniform",
     "phasefuse_rc12",
+    "phasefuse_rc14",
 )
 
 
