@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "status": "frozen_before_n30_signal_generation_or_outcomes",
+  "method": {
+    "name": "phasefuse_nested_r2",
+    "frozen_source_commit": "258dad062e623f7571559add70658cc7f3ba2034",
+    "config_path": "configs/nested_r2_frozen.yaml",
+    "config_sha256": "d3512cf41506b214c86cce72f607390184cecfa7b9bd4750adcc4122788e61e9",
+    "frame_budget": 16,
+    "comparison": "phasefuse_nested_r2 - canonical_uniform",
+    "outer_origins": [0, 1, 2, 3, 4],
+    "qwen_cells_if_later_approved": 10,
+    "uniform_prediction_reuse": false
+  },
+  "videomme": {
+    "annotation_sha256": "cc02294caaebdc6f07d9a850c84d6cda5978609c1884c91adc3dbcec90deed44",
+    "annotation_size_bytes": 1353093,
+    "cohort_path": "protocols/nested_r2_n30_cohort.tsv",
+    "cohort_sha256": "caddfd261119366048e1180420987d7b1f2b4b3327cc22fb1398d1a3c21f57cd",
+    "cohort_size_bytes": 1215,
+    "cohort_num_videos": 30,
+    "cohort_construction": "scan annotation row order, retain first row per video_id, enumerate zero-based, exclude VideoMME development IDs 001-020 and missing MP4s, rank ascending within each duration/domain stratum by sha256((salt + '|' + video_id).encode('utf-8')).hexdigest(), take the frozen quotas, then serialize selected rows index-sorted as index/video_id/videoID/duration/domain tab-separated UTF-8 LF rows without a header",
+    "cohort_rank_salt": "phasefuse-v2-holdout-v1|repo=3ec7dc57a21bcacec4eb40be6138bb2d5142c01a|annotation=cc02294caaebdc6f07d9a850c84d6cda5978609c1884c91adc3dbcec90deed44",
+    "cohort_quotas": {
+      "domain_order": ["Knowledge", "Film & Television", "Sports Competition", "Artistic Performance", "Life Record", "Multilingual"],
+      "short": [3, 2, 1, 1, 2, 1],
+      "medium": [3, 1, 2, 2, 2, 0],
+      "long": [3, 2, 1, 1, 2, 1]
+    },
+    "frozen_indices": [36, 65, 66, 108, 117, 164, 201, 263, 278, 293, 309, 376, 379, 392, 443, 445, 480, 514, 521, 542, 604, 622, 650, 705, 707, 743, 807, 850, 864, 890],
+    "expected_questions_per_video": 3,
+    "expected_decision_rows": 900,
+    "expected_trace_rows": 900,
+    "expected_prediction_rows_if_later_approved": 900
+  },
+  "preprocessing": {
+    "phasefuse_config_path": "configs/phasefuse_icassp.yaml",
+    "phasefuse_config_sha256": "949e8de2356ebf48ae8f3f418eb089c4aab82b2010abc378c94e5f012d2ccd6f",
+    "feature_model": "blip2",
+    "feature_checkpoint_revision": "520bf73fd0ef6ccce791cd3f06908040aef2d8cc",
+    "feature_device": "cuda:0",
+    "feature_batch_size": 8,
+    "frame_buffer_size": 256,
+    "sampling_master_seed": 20260812,
+    "base_sample_fps": 1.0,
+    "dense_sample_fps": 4.0,
+    "num_inner_phases": 4,
+    "num_outer_origins": 5,
+    "nearest_pts_tie": "earlier"
+  },
+  "development_exclusions": {
+    "videomme_video_ids": ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "014", "015", "016", "017", "018", "019", "020"],
+    "videomme_source_ids": ["fFjv93ACGo8", "N1cdUjctpG8", "HIjX8OPuf-w", "HwnB8aCn8yE", "24i4ncHuf6A", "40BlVzjxu-I", "0ay2Qy3wBe8", "_tvmjsKXTu8", "sUDY-SMREtA", "PSt_op3fQck", "OE5S-NbNsro", "qvwfWyU9Gfc", "5wLv3pCqZ9o", "uqILuTcux_o", "eXKE0nAMmg4", "5_fXicEnKKk", "O0qVPW1fUn4", "tX8a00l_Dfs", "mVIXU0x9ocI", "YPaLGP_xr-w"]
+  },
+  "qv100_exclusions": {
+    "input_manifest_path": "/home/elicer/videounderstanding/outputs/local-data/qvhighlights/manifests/val100_clear_phase16.jsonl",
+    "input_manifest_sha256": "5b89434552f242502a5f00636f8aabd9186e8d6ab5c5de98d4372fcbfe4469ad",
+    "input_manifest_size_bytes": 160443,
+    "input_manifest_rows": 100,
+    "unique_clip_ids": 100,
+    "unique_source_ids": 88,
+    "selection_rule_version": "qvhighlights_clear_phase_v1",
+    "annotation_sha256": "f668a1eaea156ec5315e14718999cea043a8cf948d3cafbd8e8d655318c3cd02",
+    "source_id_rule": "first 11 characters of video_id",
+    "source_ids": [
+      "-_s0sXOfS3w", "-gNwItPwMhM", "00DH3yn5C30", "13U4xVzZFQ8", "2I9-kvemtSU", "2vFzBa_WKNg", "39AFfSOXl-8", "4IYQN95j6ok", "5wDSfYr9bgU", "6OV8g7JkMvg", "71Fa81Wr-dE", "8yHwJ3f7Fi4", "A0JmK8Dwv3Q", "AD0qNZy48_s", "AWoPkPjhxSo", "A_MFAuOwK5k", "BxujMCkwFLI", "CXTWqVz5rhY", "DTh3uCDtres", "DTrwYYi25Dc", "EwItjBAwCbQ", "FWy5ZcDu_i8", "GizQlpAvD8s", "H15bUc-1LJo", "H3fhZxUC5M8", "Ho_5YisGHyU", "HzMhnd_AJhw", "IAbAn-MkMH8", "KDpsbJHx1RI", "M0aeShHuNvg", "M7mePz5cXDk", "MkdG8OXExIo", "NUsG9BgSes0", "Nhelnhenn1w", "Ps1SNAGQTc0", "SD3Rg6hTEzw", "TQ0nr6gTX6w", "TSi_JjS_nmk", "UaYhvOSmzNc", "VYco9EldD0Q", "WtAOsyldvJk", "ZxHh_2YdmT4", "_NznSSfDxdo", "_RiI6qVZ1Hk", "_e8_yuedv6w", "a2KIsaS9iJg", "abRmll8VM9k", "bEmdM0Peb_o", "bTqMo5klaCE", "c-fzjF9ubUc", "cLvULsyPH4E", "eX-EpPDjlUs", "ez8kypBrMVE", "g614xfyWKoE", "h6sCcWcLU7A", "hYGAJNV6eYY", "hl_ErejT_CE", "idvZpkYWOMQ", "iuMlh75-tzs", "j9NNAmqweOA", "jga6urWEs7Y", "k4cmv7wjjt0", "m0cZFcXa5sc", "m_-A8xoc1Oo", "mbdj8xfSIKo", "nY42UppPhhg", "ny_1mBy6anU", "oQeSC0A1wuc", "ocLUzCNodj4", "pWtzuphf8nc", "qHSeudOaXwk", "qaDShOiRe-0", "ruYn5dOkIyI", "seGgZtmWh9E", "slQPJSfZ_4o", "u4GsXRzTqf8", "uE1ciE0PCIU", "v9bV5ERmcCk", "xHypiQpL2yQ", "xVJMPmmW7rE", "xjV76k420Rc", "xqe9FSBJDx0", "yId2wIocTys", "yeCaAL4uM-U", "yuj1y5__jXg", "z96UT5W0sfM", "zKs0TO6ZTBI", "zTf-3BOLi8w"
+    ],
+    "videomme_source_overlap_required": []
+  },
+  "selector_endpoints_before_qwen": [
+    "nested-R2 coverage and relocation invariants on every row",
+    "origin-wise relocation rate and counts for zero/one/two relocations",
+    "F1 at 0.25/0.5/1.0 seconds against the paired canonical-uniform targets",
+    "fresh nearest-PTS decode exactness and RGB pixel-hash roundtrip"
+  ],
+  "future_qwen_gate": {
+    "checkpoint_revision": "cc594898137f460bfe9f0759e9844b3ce807cfb5",
+    "max_num_frames": 16,
+    "max_pixels": 200704,
+    "attention": "sdpa",
+    "batch_size": 1,
+    "prompt_and_generation_contract": "same VideoMME lmms-eval task and deterministic generation contract as the sealed RC12/RC14 runs",
+    "bootstrap_clusters": "video_id",
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 20260813,
+    "accuracy_noninferiority": "95% CI lower bound for delta_mean_accuracy strictly greater than -0.03",
+    "pad_safety": "95% CI upper bound for delta_pairwise_answer_disagreement strictly less than +0.03"
+  },
+  "stopping_rule": "Run this single frozen n30 cohort and configuration. Do not replace videos or tune parameters, thresholds, cohort, endpoints, decoding, prompts, or generation settings after any n30 signal or outcome is opened. Preserve null and negative results. No Qwen inference without a separate approval after selector/exact-decode validation."
+}

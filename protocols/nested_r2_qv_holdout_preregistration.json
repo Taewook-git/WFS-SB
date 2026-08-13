@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "status": "frozen_before_qv_holdout_scout_or_outcomes",
+  "method": {
+    "name": "phasefuse_nested_r2",
+    "frozen_source_commit": "258dad062e623f7571559add70658cc7f3ba2034",
+    "config_path": "configs/nested_r2_frozen.yaml",
+    "config_sha256": "d3512cf41506b214c86cce72f607390184cecfa7b9bd4750adcc4122788e61e9",
+    "frame_budget": 16,
+    "comparison": "phasefuse_nested_r2 - canonical_uniform",
+    "outer_origins": [0, 1, 2, 3, 4]
+  },
+  "qvhighlights": {
+    "annotation_path": "/home/elicer/videounderstanding/outputs/local-data/qvhighlights/annotations/highlight_val_release.jsonl",
+    "annotation_sha256": "f668a1eaea156ec5315e14718999cea043a8cf948d3cafbd8e8d655318c3cd02",
+    "annotation_size_bytes": 821101,
+    "annotation_rows": 1550,
+    "development_manifest_path": "/home/elicer/videounderstanding/outputs/local-data/qvhighlights/manifests/val100_clear_phase16.jsonl",
+    "development_manifest_sha256": "5b89434552f242502a5f00636f8aabd9186e8d6ab5c5de98d4372fcbfe4469ad",
+    "development_manifest_size_bytes": 160443,
+    "development_manifest_rows": 100,
+    "excluded_sources_path": "protocols/nested_r2_qv_dev_excluded_sources.txt",
+    "excluded_sources_sha256": "6fd1db129754094b10aef4375c1e1364150f501d7af1e1fa910ae0bafcd497c1",
+    "excluded_sources_size_bytes": 1056,
+    "excluded_sources_count": 88,
+    "cohort_path": "protocols/nested_r2_qv_holdout_cohort.tsv",
+    "cohort_sha256": "349f450a169fc1160429738f30028f38b6401b5f33c3760d02d70b3111ccb3b4",
+    "cohort_size_bytes": 4777,
+    "cohort_num_sources": 100,
+    "cohort_num_rows": 100,
+    "cohort_fields": ["rank", "source_id", "annotation_row_index", "vid", "qid"],
+    "source_id_rule": "str(vid).rsplit('_', 2)[0], required length 11",
+    "rank_salt": "phasefuse-nested-r2-qv-holdout-v1|config=d3512cf41506b214c86cce72f607390184cecfa7b9bd4750adcc4122788e61e9|annotation=f668a1eaea156ec5315e14718999cea043a8cf948d3cafbd8e8d655318c3cd02|dev_manifest=5b89434552f242502a5f00636f8aabd9186e8d6ab5c5de98d4372fcbfe4469ad",
+    "cohort_construction": "Load annotation and development JSONL in physical nonempty-row order. Exclude the 88 development source IDs. Within every remaining source choose the row minimizing (sha256(base+'|row|'+source+'|'+vid+'|'+str(qid)), annotation_row_index). Rank sources by (sha256(base+'|source|'+source), source), take 100, enumerate rank 0..99, and serialize the five cohort fields tab-separated as UTF-8 LF without a header.",
+    "all_source_mp4s_present_at_freeze": true,
+    "source_mp4_total_size_bytes": 1116190395
+  },
+  "selector_endpoints": {
+    "ordered_primary": [
+      "delta relevant-frame fraction; advance only if the video-cluster 95% CI lower bound is above zero",
+      "delta clip recall, tested only if the first endpoint advances"
+    ],
+    "secondary": [
+      "saliency-vote delta",
+      "nearest-event distance",
+      "relocation rate",
+      "origin-wise effects"
+    ],
+    "deterministic_audits": [
+      "exactly 16 targets",
+      "at least 14 exact A16 targets retained",
+      "one target per A16 Voronoi region",
+      "edge anchors retained",
+      "at most two non-adjacent positive-gain relocations",
+      "fresh nearest-PTS decode and RGB hash roundtrip"
+    ]
+  },
+  "bootstrap": {
+    "cluster": "source_id",
+    "resamples": 10000,
+    "seed": 20260813,
+    "confidence": 0.95
+  },
+  "stage_gates": {
+    "stage0_selector_to_qwen": "All cohort/source/decode/nested invariants pass and are sealed before labels; QV delta selected_relevant_fraction has a source-cluster 95% percentile CI lower bound strictly above zero. Only then test delta relevant_clip_recall lower CI > 0 hierarchically and report it, but a secondary failure is not a Qwen-launch co-gate.",
+    "stage0_primary_failure": "Clip recall becomes descriptive and Qwen must not launch.",
+    "stage1_qwen": "Run all 10 cells with no interim stop. Utility-safe only if accuracy delta CI lower > -0.03 and PAD delta CI upper < +0.03."
+  },
+  "execution": {
+    "scout_or_outcomes_opened": false,
+    "qwen_applicable": false,
+    "current_authorized_scope": "protocol materialization only; no QV scout or outcome evaluation"
+  },
+  "stopping_rule": "Run this one frozen QV holdout cohort/configuration only after separate approval. Do not replace sources or tune the selector, cohort, endpoint order, decoding, or bootstrap after any QV holdout scout or outcome is opened. Preserve null and negative results."
+}
